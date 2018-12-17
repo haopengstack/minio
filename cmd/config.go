@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2015, 2016 Minio, Inc.
+ * Minio Cloud Storage, (C) 2018 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,77 +17,198 @@
 package cmd
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"os"
-	"path/filepath"
-	"sync"
+	"path"
+	"runtime"
+	"strings"
+	"time"
 
-	"github.com/minio/go-homedir"
+	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/quick"
 )
 
-// configPath for custom config path only for testing purposes
-var customConfigPath string
-var configMu sync.Mutex
+const (
+	minioConfigPrefix = "config"
 
-// Sets a new config path.
-func setGlobalConfigPath(configPath string) {
-	configMu.Lock()
-	defer configMu.Unlock()
-	customConfigPath = configPath
-}
+	// Minio configuration file.
+	minioConfigFile = "config.json"
 
-// getConfigPath get server config path
-func getConfigPath() (string, error) {
-	configMu.Lock()
-	defer configMu.Unlock()
+	// Minio backup file
+	minioConfigBackupFile = minioConfigFile + ".backup"
+)
 
-	if customConfigPath != "" {
-		return customConfigPath, nil
+func saveServerConfig(ctx context.Context, objAPI ObjectLayer, config *serverConfig) error {
+	if err := quick.CheckData(config); err != nil {
+		return err
 	}
-	homeDir, err := homedir.Dir()
-	if err != nil {
-		return "", err
-	}
-	configPath := filepath.Join(homeDir, globalMinioConfigDir)
-	return configPath, nil
-}
 
-// mustGetConfigPath must get server config path.
-func mustGetConfigPath() string {
-	configPath, err := getConfigPath()
-	if err != nil {
-		return ""
-	}
-	return configPath
-}
-
-// createConfigPath create server config path.
-func createConfigPath() error {
-	configPath, err := getConfigPath()
+	data, err := json.MarshalIndent(config, "", "\t")
 	if err != nil {
 		return err
 	}
-	return os.MkdirAll(configPath, 0700)
+
+	configFile := path.Join(minioConfigPrefix, minioConfigFile)
+	if globalEtcdClient != nil {
+		timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		_, err = globalEtcdClient.Put(timeoutCtx, configFile, string(data))
+		defer cancel()
+		return err
+	}
+
+	// Create a backup of the current config
+	oldData, err := readConfig(ctx, objAPI, configFile)
+	if err == nil {
+		backupConfigFile := path.Join(minioConfigPrefix, minioConfigBackupFile)
+		if err = saveConfig(ctx, objAPI, backupConfigFile, oldData); err != nil {
+			return err
+		}
+	} else {
+		if err != errConfigNotFound {
+			return err
+		}
+	}
+
+	// Save the new config in the std config path
+	return saveConfig(ctx, objAPI, configFile, data)
 }
 
-// isConfigFileExists - returns true if config file exists.
-func isConfigFileExists() bool {
-	path, err := getConfigFile()
+func readServerConfig(ctx context.Context, objAPI ObjectLayer) (*serverConfig, error) {
+	var configData []byte
+	var err error
+
+	configFile := path.Join(minioConfigPrefix, minioConfigFile)
+	if globalEtcdClient != nil {
+		configData, err = readConfigEtcd(ctx, globalEtcdClient, configFile)
+	} else {
+		configData, err = readConfig(ctx, objAPI, configFile)
+	}
 	if err != nil {
-		return false
+		return nil, err
 	}
-	st, err := os.Stat(path)
-	// If file exists and is regular return true.
-	if err == nil && st.Mode().IsRegular() {
-		return true
+
+	if runtime.GOOS == "windows" {
+		configData = bytes.Replace(configData, []byte("\r\n"), []byte("\n"), -1)
 	}
-	return false
+
+	if err = quick.CheckDuplicateKeys(string(configData)); err != nil {
+		return nil, err
+	}
+
+	var config = &serverConfig{}
+	if err = json.Unmarshal(configData, config); err != nil {
+		return nil, err
+	}
+
+	if err = quick.CheckData(config); err != nil {
+		return nil, err
+	}
+
+	return config, nil
 }
 
-// getConfigFile get server config file.
-func getConfigFile() (string, error) {
-	configPath, err := getConfigPath()
-	if err != nil {
-		return "", err
+// ConfigSys - config system.
+type ConfigSys struct{}
+
+// Load - load config.json.
+func (sys *ConfigSys) Load(objAPI ObjectLayer) error {
+	return sys.Init(objAPI)
+}
+
+// Init - initializes config system from config.json.
+func (sys *ConfigSys) Init(objAPI ObjectLayer) error {
+	if objAPI == nil {
+		return errInvalidArgument
 	}
-	return filepath.Join(configPath, globalMinioConfigFile), nil
+
+	doneCh := make(chan struct{})
+	defer close(doneCh)
+
+	// Initializing configuration needs a retry mechanism for
+	// the following reasons:
+	//  - Read quorum is lost just after the initialization
+	//    of the object layer.
+	//  - Write quorum not met when upgrading configuration
+	//    version is needed.
+	retryTimerCh := newRetryTimerSimple(doneCh)
+	for {
+		select {
+		case _ = <-retryTimerCh:
+			err := initConfig(objAPI)
+			if err != nil {
+				if strings.Contains(err.Error(), InsufficientReadQuorum{}.Error()) ||
+					strings.Contains(err.Error(), InsufficientWriteQuorum{}.Error()) {
+					logger.Info("Waiting for configuration to be initialized..")
+					continue
+				}
+				return err
+			}
+
+			return nil
+		}
+	}
+}
+
+// NewConfigSys - creates new config system object.
+func NewConfigSys() *ConfigSys {
+	return &ConfigSys{}
+}
+
+// Initialize and load config from remote etcd or local config directory
+func initConfig(objAPI ObjectLayer) error {
+	if objAPI == nil {
+		return errServerNotInitialized
+	}
+
+	if globalEtcdClient != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		resp, err := globalEtcdClient.Get(ctx, getConfigFile())
+		cancel()
+		if err == nil && resp.Count > 0 {
+			if err = migrateConfig(); err != nil {
+				return err
+			}
+
+			// Migrates etcd ${HOME}/.minio/config.json to '/config/config.json'
+			if err := migrateConfigToMinioSys(objAPI); err != nil {
+				return err
+			}
+		}
+	} else {
+		if isFile(getConfigFile()) {
+			if err := migrateConfig(); err != nil {
+				return err
+			}
+		}
+		// Migrates ${HOME}/.minio/config.json or config.json.deprecated
+		// to '<export_path>/.minio.sys/config/config.json'
+		// ignore if the file doesn't exist.
+		if err := migrateConfigToMinioSys(objAPI); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+
+	configFile := path.Join(minioConfigPrefix, minioConfigFile)
+
+	// Watch config for changes and reloads them in-memory.
+	go watchConfig(objAPI, configFile, loadConfig)
+
+	if err := checkConfig(context.Background(), objAPI, configFile); err != nil {
+		if err == errConfigNotFound {
+			// Config file does not exist, we create it fresh and return upon success.
+			if err = newSrvConfig(objAPI); err != nil {
+				return err
+			}
+		} else {
+			return err
+		}
+	}
+
+	if err := migrateMinioSysConfig(objAPI); err != nil {
+		return err
+	}
+
+	return loadConfig(objAPI)
 }

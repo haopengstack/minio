@@ -17,8 +17,9 @@
 package cmd
 
 import (
-	"io/ioutil"
-	"strings"
+	"context"
+	"net/http"
+	"reflect"
 	"testing"
 )
 
@@ -41,6 +42,8 @@ func TestIsValidBucketName(t *testing.T) {
 		{"testbucket", true},
 		{"1bucket", true},
 		{"bucket1", true},
+		{"a.b", true},
+		{"ab.a.bc", true},
 		// cases for which test should fail.
 		// passing invalid bucket names.
 		{"------", false},
@@ -59,11 +62,14 @@ func TestIsValidBucketName(t *testing.T) {
 		{"ends-with-a-dot.", false},
 		{"ends-with-a-dash-", false},
 		{"-starts-with-a-dash", false},
-		{"THIS-BEINGS-WITH-UPPERCASe", false},
+		{"THIS-BEGINS-WITH-UPPERCASe", false},
 		{"tHIS-ENDS-WITH-UPPERCASE", false},
-		{"ThisBeginsAndEndsWithUpperCase", false},
+		{"ThisBeginsAndEndsWithUpperCasE", false},
 		{"una ñina", false},
-		{"lalalallalallalalalallalallalala-theString-size-is-greater-than-64", false},
+		{"dash-.may-not-appear-next-to-dot", false},
+		{"dash.-may-not-appear-next-to-dot", false},
+		{"dash-.-may-not-appear-next-to-dot", false},
+		{"lalalallalallalalalallalallalala-thestring-size-is-greater-than-63", false},
 	}
 
 	for i, testCase := range testCases {
@@ -95,12 +101,22 @@ func TestIsValidObjectName(t *testing.T) {
 		{"contains-|-pipe", true},
 		{"contains-\"-quote", true},
 		{"contains-`-tick", true},
+		{"..test", true},
+		{".. test", true},
+		{". test", true},
+		{".test", true},
 		{"There are far too many object names, and far too few bucket names!", true},
 		// cases for which test should fail.
 		// passing invalid object names.
 		{"", false},
 		{"a/b/c/", false},
 		{"/a/b/c", false},
+		{"../../etc", false},
+		{"../../", false},
+		{"/../../etc", false},
+		{" ../etc", false},
+		{"./././", false},
+		{"./etc", false},
 		{"contains-\\-backslash", false},
 		{string([]byte{0xff, 0xfe, 0xfd}), false},
 	}
@@ -116,53 +132,25 @@ func TestIsValidObjectName(t *testing.T) {
 	}
 }
 
-// Tests rangeReader.
-func TestRangeReader(t *testing.T) {
-	testCases := []struct {
-		data   string
-		minLen int64
-		maxLen int64
-		err    error
-	}{
-		{"1234567890", 0, 15, nil},
-		{"1234567890", 0, 10, nil},
-		{"1234567890", 0, 5, toObjectErr(errDataTooLarge, "test", "test")},
-		{"123", 5, 10, toObjectErr(errDataTooSmall, "test", "test")},
-		{"123", 2, 10, nil},
-	}
-
-	for i, test := range testCases {
-		r := strings.NewReader(test.data)
-		_, err := ioutil.ReadAll(&rangeReader{
-			Reader: r,
-			Min:    test.minLen,
-			Max:    test.maxLen,
-		})
-		if toObjectErr(err, "test", "test") != test.err {
-			t.Fatalf("test %d failed: expected %v, got %v", i+1, test.err, err)
-		}
-	}
-}
-
 // Tests getCompleteMultipartMD5
 func TestGetCompleteMultipartMD5(t *testing.T) {
 	testCases := []struct {
-		parts          []completePart
+		parts          []CompletePart
 		expectedResult string
 		expectedErr    string
 	}{
 		// Wrong MD5 hash string
-		{[]completePart{{ETag: "wrong-md5-hash-string"}}, "", "encoding/hex: odd length hex string"},
+		{[]CompletePart{{ETag: "wrong-md5-hash-string"}}, "", "encoding/hex: invalid byte: U+0077 'w'"},
 
-		// Single completePart with valid MD5 hash string.
-		{[]completePart{{ETag: "cf1f738a5924e645913c984e0fe3d708"}}, "10dc1617fbcf0bd0858048cb96e6bd77-1", ""},
+		// Single CompletePart with valid MD5 hash string.
+		{[]CompletePart{{ETag: "cf1f738a5924e645913c984e0fe3d708"}}, "10dc1617fbcf0bd0858048cb96e6bd77-1", ""},
 
-		// Multiple completePart with valid MD5 hash string.
-		{[]completePart{{ETag: "cf1f738a5924e645913c984e0fe3d708"}, {ETag: "9ccbc9a80eee7fb6fdd22441db2aedbd"}}, "0239a86b5266bb624f0ac60ba2aed6c8-2", ""},
+		// Multiple CompletePart with valid MD5 hash string.
+		{[]CompletePart{{ETag: "cf1f738a5924e645913c984e0fe3d708"}, {ETag: "9ccbc9a80eee7fb6fdd22441db2aedbd"}}, "0239a86b5266bb624f0ac60ba2aed6c8-2", ""},
 	}
 
 	for i, test := range testCases {
-		result, err := getCompleteMultipartMD5(test.parts)
+		result, err := getCompleteMultipartMD5(context.Background(), test.parts)
 		if result != test.expectedResult {
 			t.Fatalf("test %d failed: expected: result=%v, got=%v", i+1, test.expectedResult, result)
 		}
@@ -172,6 +160,387 @@ func TestGetCompleteMultipartMD5(t *testing.T) {
 		}
 		if errString != test.expectedErr {
 			t.Fatalf("test %d failed: expected: err=%v, got=%v", i+1, test.expectedErr, err)
+		}
+	}
+}
+
+// TestIsMinioBucketName - Tests isMinioBucketName helper function.
+func TestIsMinioMetaBucketName(t *testing.T) {
+	testCases := []struct {
+		bucket string
+		result bool
+	}{
+		// Minio meta bucket.
+		{
+			bucket: minioMetaBucket,
+			result: true,
+		},
+		// Minio meta bucket.
+		{
+			bucket: minioMetaMultipartBucket,
+			result: true,
+		},
+		// Minio meta bucket.
+		{
+			bucket: minioMetaTmpBucket,
+			result: true,
+		},
+		// Normal bucket
+		{
+			bucket: "mybucket",
+			result: false,
+		},
+	}
+
+	for i, test := range testCases {
+		actual := isMinioMetaBucketName(test.bucket)
+		if actual != test.result {
+			t.Errorf("Test %d - expected %v but received %v",
+				i+1, test.result, actual)
+		}
+	}
+}
+
+// Tests RemoveStandardStorageClass method. Expectation is metadata map
+// should be cleared of x-amz-storage-class, if it is set to STANDARD
+func TestRemoveStandardStorageClass(t *testing.T) {
+	tests := []struct {
+		name     string
+		metadata map[string]string
+		want     map[string]string
+	}{
+		{
+			name:     "1",
+			metadata: map[string]string{"content-type": "application/octet-stream", "etag": "de75a98baf2c6aef435b57dd0fc33c86", "x-amz-storage-class": "STANDARD"},
+			want:     map[string]string{"content-type": "application/octet-stream", "etag": "de75a98baf2c6aef435b57dd0fc33c86"},
+		},
+		{
+			name:     "2",
+			metadata: map[string]string{"content-type": "application/octet-stream", "etag": "de75a98baf2c6aef435b57dd0fc33c86", "x-amz-storage-class": "REDUCED_REDUNDANCY"},
+			want:     map[string]string{"content-type": "application/octet-stream", "etag": "de75a98baf2c6aef435b57dd0fc33c86", "x-amz-storage-class": "REDUCED_REDUNDANCY"},
+		},
+		{
+			name:     "3",
+			metadata: map[string]string{"content-type": "application/octet-stream", "etag": "de75a98baf2c6aef435b57dd0fc33c86"},
+			want:     map[string]string{"content-type": "application/octet-stream", "etag": "de75a98baf2c6aef435b57dd0fc33c86"},
+		},
+	}
+	for _, tt := range tests {
+		if got := removeStandardStorageClass(tt.metadata); !reflect.DeepEqual(got, tt.want) {
+			t.Errorf("Test %s failed, expected %v, got %v", tt.name, tt.want, got)
+		}
+	}
+}
+
+// Tests CleanMetadata method. Expectation is metadata map
+// should be cleared of etag, md5Sum and x-amz-storage-class, if it is set to STANDARD
+func TestCleanMetadata(t *testing.T) {
+	tests := []struct {
+		name     string
+		metadata map[string]string
+		want     map[string]string
+	}{
+		{
+			name:     "1",
+			metadata: map[string]string{"content-type": "application/octet-stream", "etag": "de75a98baf2c6aef435b57dd0fc33c86", "x-amz-storage-class": "STANDARD"},
+			want:     map[string]string{"content-type": "application/octet-stream"},
+		},
+		{
+			name:     "2",
+			metadata: map[string]string{"content-type": "application/octet-stream", "etag": "de75a98baf2c6aef435b57dd0fc33c86", "x-amz-storage-class": "REDUCED_REDUNDANCY"},
+			want:     map[string]string{"content-type": "application/octet-stream", "x-amz-storage-class": "REDUCED_REDUNDANCY"},
+		},
+		{
+			name:     "3",
+			metadata: map[string]string{"content-type": "application/octet-stream", "etag": "de75a98baf2c6aef435b57dd0fc33c86", "md5Sum": "abcde"},
+			want:     map[string]string{"content-type": "application/octet-stream"},
+		},
+	}
+	for _, tt := range tests {
+		if got := cleanMetadata(tt.metadata); !reflect.DeepEqual(got, tt.want) {
+			t.Errorf("Test %s failed, expected %v, got %v", tt.name, tt.want, got)
+		}
+	}
+}
+
+// Tests CleanMetadataKeys method. Expectation is metadata map
+// should be cleared of keys passed to CleanMetadataKeys method
+func TestCleanMetadataKeys(t *testing.T) {
+	tests := []struct {
+		name     string
+		metadata map[string]string
+		keys     []string
+		want     map[string]string
+	}{
+		{
+			name:     "1",
+			metadata: map[string]string{"content-type": "application/octet-stream", "etag": "de75a98baf2c6aef435b57dd0fc33c86", "x-amz-storage-class": "STANDARD", "md5": "abcde"},
+			keys:     []string{"etag", "md5"},
+			want:     map[string]string{"content-type": "application/octet-stream", "x-amz-storage-class": "STANDARD"},
+		},
+		{
+			name:     "2",
+			metadata: map[string]string{"content-type": "application/octet-stream", "etag": "de75a98baf2c6aef435b57dd0fc33c86", "x-amz-storage-class": "REDUCED_REDUNDANCY", "md5sum": "abcde"},
+			keys:     []string{"etag", "md5sum"},
+			want:     map[string]string{"content-type": "application/octet-stream", "x-amz-storage-class": "REDUCED_REDUNDANCY"},
+		},
+		{
+			name:     "3",
+			metadata: map[string]string{"content-type": "application/octet-stream", "etag": "de75a98baf2c6aef435b57dd0fc33c86", "xyz": "abcde"},
+			keys:     []string{"etag", "xyz"},
+			want:     map[string]string{"content-type": "application/octet-stream"},
+		},
+	}
+	for _, tt := range tests {
+		if got := cleanMetadataKeys(tt.metadata, tt.keys...); !reflect.DeepEqual(got, tt.want) {
+			t.Errorf("Test %s failed, expected %v, got %v", tt.name, tt.want, got)
+		}
+	}
+}
+
+// Tests isCompressed method
+func TestIsCompressed(t *testing.T) {
+	testCases := []struct {
+		objInfo ObjectInfo
+		result  bool
+	}{
+		{
+			objInfo: ObjectInfo{
+				UserDefined: map[string]string{"X-Minio-Internal-compression": "golang/snappy/LZ77",
+					"content-type": "application/octet-stream",
+					"etag":         "b3ff3ef3789147152fbfbc50efba4bfd-2"},
+			},
+			result: true,
+		},
+		{
+			objInfo: ObjectInfo{
+				UserDefined: map[string]string{"X-Minio-Internal-XYZ": "golang/snappy/LZ77",
+					"content-type": "application/octet-stream",
+					"etag":         "b3ff3ef3789147152fbfbc50efba4bfd-2"},
+			},
+			result: false,
+		},
+		{
+			objInfo: ObjectInfo{
+				UserDefined: map[string]string{"content-type": "application/octet-stream",
+					"etag": "b3ff3ef3789147152fbfbc50efba4bfd-2"},
+			},
+			result: false,
+		},
+	}
+	for i, test := range testCases {
+		got := test.objInfo.IsCompressed()
+		if got != test.result {
+			t.Errorf("Test %d - expected %v but received %v",
+				i+1, test.result, got)
+		}
+	}
+}
+
+// Tests excludeForCompression.
+func TestExcludeForCompression(t *testing.T) {
+	testCases := []struct {
+		object string
+		header http.Header
+		result bool
+	}{
+		{
+			object: "object.txt",
+			header: http.Header{
+				"Content-Type": []string{"application/zip"},
+			},
+			result: true,
+		},
+		{
+			object: "object.zip",
+			header: http.Header{
+				"Content-Type": []string{"application/XYZ"},
+			},
+			result: true,
+		},
+		{
+			object: "object.json",
+			header: http.Header{
+				"Content-Type": []string{"application/json"},
+			},
+			result: false,
+		},
+		{
+			object: "object.txt",
+			header: http.Header{
+				"Content-Type": []string{"text/plain"},
+			},
+			result: false,
+		},
+	}
+	for i, test := range testCases {
+		globalIsCompressionEnabled = true
+		got := excludeForCompression(test.header, test.object)
+		globalIsCompressionEnabled = false
+		if got != test.result {
+			t.Errorf("Test %d - expected %v but received %v",
+				i+1, test.result, got)
+		}
+	}
+}
+
+// Test getPartFile function.
+func TestGetPartFile(t *testing.T) {
+	testCases := []struct {
+		entries    []string
+		partNumber int
+		etag       string
+		result     string
+	}{
+		{
+			entries:    []string{"00001.8a034f82cb9cb31140d87d3ce2a9ede3.67108864", "fs.json", "00002.d73d8ab724016dfb051e2d3584495c54.32891137"},
+			partNumber: 1,
+			etag:       "8a034f82cb9cb31140d87d3ce2a9ede3",
+			result:     "00001.8a034f82cb9cb31140d87d3ce2a9ede3.67108864",
+		},
+		{
+			entries:    []string{"00001.8a034f82cb9cb31140d87d3ce2a9ede3.67108864", "fs.json", "00002.d73d8ab724016dfb051e2d3584495c54.32891137"},
+			partNumber: 2,
+			etag:       "d73d8ab724016dfb051e2d3584495c54",
+			result:     "00002.d73d8ab724016dfb051e2d3584495c54.32891137",
+		},
+		{
+			entries:    []string{"00001.8a034f82cb9cb31140d87d3ce2a9ede3.67108864", "fs.json", "00002.d73d8ab724016dfb051e2d3584495c54.32891137"},
+			partNumber: 1,
+			etag:       "d73d8ab724016dfb051e2d3584495c54",
+			result:     "",
+		},
+	}
+	for i, test := range testCases {
+		got := getPartFile(test.entries, test.partNumber, test.etag)
+		if got != test.result {
+			t.Errorf("Test %d - expected %s but received %s",
+				i+1, test.result, got)
+		}
+	}
+}
+
+func TestGetActualSize(t *testing.T) {
+	testCases := []struct {
+		objInfo ObjectInfo
+		result  int64
+	}{
+		{
+			objInfo: ObjectInfo{
+				UserDefined: map[string]string{"X-Minio-Internal-compression": "golang/snappy/LZ77",
+					"X-Minio-Internal-actual-size": "100000001",
+					"content-type":                 "application/octet-stream",
+					"etag":                         "b3ff3ef3789147152fbfbc50efba4bfd-2"},
+				Parts: []objectPartInfo{
+					{
+						Size:       39235668,
+						ActualSize: 67108864,
+					},
+					{
+						Size:       19177372,
+						ActualSize: 32891137,
+					},
+				},
+			},
+			result: 100000001,
+		},
+		{
+			objInfo: ObjectInfo{
+				UserDefined: map[string]string{"X-Minio-Internal-compression": "golang/snappy/LZ77",
+					"X-Minio-Internal-actual-size": "841",
+					"content-type":                 "application/octet-stream",
+					"etag":                         "b3ff3ef3789147152fbfbc50efba4bfd-2"},
+				Parts: []objectPartInfo{},
+			},
+			result: 841,
+		},
+		{
+			objInfo: ObjectInfo{
+				UserDefined: map[string]string{"X-Minio-Internal-compression": "golang/snappy/LZ77",
+					"content-type": "application/octet-stream",
+					"etag":         "b3ff3ef3789147152fbfbc50efba4bfd-2"},
+				Parts: []objectPartInfo{},
+			},
+			result: -1,
+		},
+	}
+	for i, test := range testCases {
+		got := test.objInfo.GetActualSize()
+		if got != test.result {
+			t.Errorf("Test %d - expected %d but received %d",
+				i+1, test.result, got)
+		}
+	}
+}
+
+func TestGetCompressedOffsets(t *testing.T) {
+	testCases := []struct {
+		objInfo           ObjectInfo
+		offset            int64
+		startOffset       int64
+		snappyStartOffset int64
+	}{
+		{
+			objInfo: ObjectInfo{
+				Parts: []objectPartInfo{
+					{
+						Size:       39235668,
+						ActualSize: 67108864,
+					},
+					{
+						Size:       19177372,
+						ActualSize: 32891137,
+					},
+				},
+			},
+			offset:            79109865,
+			startOffset:       39235668,
+			snappyStartOffset: 12001001,
+		},
+		{
+			objInfo: ObjectInfo{
+				Parts: []objectPartInfo{
+					{
+						Size:       39235668,
+						ActualSize: 67108864,
+					},
+					{
+						Size:       19177372,
+						ActualSize: 32891137,
+					},
+				},
+			},
+			offset:            19109865,
+			startOffset:       0,
+			snappyStartOffset: 19109865,
+		},
+		{
+			objInfo: ObjectInfo{
+				Parts: []objectPartInfo{
+					{
+						Size:       39235668,
+						ActualSize: 67108864,
+					},
+					{
+						Size:       19177372,
+						ActualSize: 32891137,
+					},
+				},
+			},
+			offset:            0,
+			startOffset:       0,
+			snappyStartOffset: 0,
+		},
+	}
+	for i, test := range testCases {
+		startOffset, snappyStartOffset := getCompressedOffsets(test.objInfo, test.offset)
+		if startOffset != test.startOffset {
+			t.Errorf("Test %d - expected startOffset %d but received %d",
+				i+1, test.startOffset, startOffset)
+		}
+		if snappyStartOffset != test.snappyStartOffset {
+			t.Errorf("Test %d - expected snappyOffset %d but received %d",
+				i+1, test.snappyStartOffset, snappyStartOffset)
 		}
 	}
 }

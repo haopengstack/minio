@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2015 Minio, Inc.
+ * Minio Cloud Storage, (C) 2015, 2016, 2017 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,13 +27,39 @@ import (
 	"time"
 )
 
+// startWithConds - map which indicates if a given condition supports starts-with policy operator
+var startsWithConds = map[string]bool{
+	"$acl":                 true,
+	"$bucket":              false,
+	"$cache-control":       true,
+	"$content-type":        true,
+	"$content-disposition": true,
+	"$content-encoding":    true,
+	"$expires":             true,
+	"$key":                 true,
+	"$success_action_redirect": true,
+	"$redirect":                true,
+	"$success_action_status":   false,
+	"$x-amz-algorithm":         false,
+	"$x-amz-credential":        false,
+	"$x-amz-date":              false,
+}
+
+// Add policy conditionals.
+const (
+	policyCondEqual         = "eq"
+	policyCondStartsWith    = "starts-with"
+	policyCondContentLength = "content-length-range"
+)
+
 // toString - Safely convert interface to string without causing panic.
 func toString(val interface{}) string {
 	switch v := val.(type) {
 	case string:
 		return v
+	default:
+		return ""
 	}
-	return ""
 }
 
 // toLowerString - safely convert interface to lower string
@@ -53,18 +79,15 @@ func toInteger(val interface{}) (int64, error) {
 	case string:
 		i, err := strconv.Atoi(v)
 		return int64(i), err
+	default:
+		return 0, errors.New("Invalid number format")
 	}
-
-	return 0, errors.New("Invalid number format")
 }
 
 // isString - Safely check if val is of type string without causing panic.
 func isString(val interface{}) bool {
-	switch val.(type) {
-	case string:
-		return true
-	}
-	return false
+	_, ok := val.(string)
+	return ok
 }
 
 // ContentLengthRange - policy content-length-range field.
@@ -87,7 +110,7 @@ type PostPolicyForm struct {
 }
 
 // parsePostPolicyForm - Parse JSON policy string into typed POostPolicyForm structure.
-func parsePostPolicyForm(policy string) (PostPolicyForm, error) {
+func parsePostPolicyForm(policy string) (ppf PostPolicyForm, e error) {
 	// Convert po into interfaces and
 	// perform strict type conversion using reflection.
 	var rawPolicy struct {
@@ -97,7 +120,7 @@ func parsePostPolicyForm(policy string) (PostPolicyForm, error) {
 
 	err := json.Unmarshal([]byte(policy), &rawPolicy)
 	if err != nil {
-		return PostPolicyForm{}, err
+		return ppf, err
 	}
 
 	parsedPolicy := PostPolicyForm{}
@@ -105,7 +128,7 @@ func parsePostPolicyForm(policy string) (PostPolicyForm, error) {
 	// Parse expiry time.
 	parsedPolicy.Expiration, err = time.Parse(time.RFC3339Nano, rawPolicy.Expiration)
 	if err != nil {
-		return PostPolicyForm{}, err
+		return ppf, err
 	}
 	parsedPolicy.Conditions.Policies = make(map[string]struct {
 		Operator string
@@ -127,7 +150,7 @@ func parsePostPolicyForm(policy string) (PostPolicyForm, error) {
 					Operator string
 					Value    string
 				}{
-					Operator: "eq",
+					Operator: policyCondEqual,
 					Value:    toString(v),
 				}
 			}
@@ -136,7 +159,7 @@ func parsePostPolicyForm(policy string) (PostPolicyForm, error) {
 				return parsedPolicy, fmt.Errorf("Malformed conditional fields %s of type %s found in POST policy form", condt, reflect.TypeOf(condt).String())
 			}
 			switch toLowerString(condt[0]) {
-			case "eq", "starts-with":
+			case policyCondEqual, policyCondStartsWith:
 				for _, v := range condt { // Pre-check all values for type.
 					if !isString(v) {
 						// All values must be of type string.
@@ -151,7 +174,7 @@ func parsePostPolicyForm(policy string) (PostPolicyForm, error) {
 					Operator: operator,
 					Value:    value,
 				}
-			case "content-length-range":
+			case policyCondContentLength:
 				min, err := toInteger(condt[1])
 				if err != nil {
 					return parsedPolicy, err
@@ -180,31 +203,13 @@ func parsePostPolicyForm(policy string) (PostPolicyForm, error) {
 	return parsedPolicy, nil
 }
 
-// startWithConds - map which indicates if a given condition supports starts-with policy operator
-var startsWithConds = map[string]bool{
-	"$acl":                 true,
-	"$bucket":              false,
-	"$cache-control":       true,
-	"$content-type":        true,
-	"$content-disposition": true,
-	"$content-encoding":    true,
-	"$expires":             true,
-	"$key":                 true,
-	"$success_action_redirect": true,
-	"$redirect":                true,
-	"$success_action_status":   false,
-	"$x-amz-algorithm":         false,
-	"$x-amz-credential":        false,
-	"$x-amz-date":              false,
-}
-
 // checkPolicyCond returns a boolean to indicate if a condition is satisified according
 // to the passed operator
 func checkPolicyCond(op string, input1, input2 string) bool {
 	switch op {
-	case "eq":
+	case policyCondEqual:
 		return input1 == input2
-	case "starts-with":
+	case policyCondStartsWith:
 		return strings.HasPrefix(input1, input2)
 	}
 	return false
@@ -212,9 +217,9 @@ func checkPolicyCond(op string, input1, input2 string) bool {
 
 // checkPostPolicy - apply policy conditions and validate input values.
 // (http://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-HTTPPOSTConstructPolicy.html)
-func checkPostPolicy(formValues map[string]string, postPolicyForm PostPolicyForm) APIErrorCode {
+func checkPostPolicy(formValues http.Header, postPolicyForm PostPolicyForm) APIErrorCode {
 	// Check if policy document expiry date is still not reached
-	if !postPolicyForm.Expiration.After(time.Now().UTC()) {
+	if !postPolicyForm.Expiration.After(UTCNow()) {
 		return ErrPolicyAlreadyExpired
 	}
 
@@ -231,16 +236,16 @@ func checkPostPolicy(formValues map[string]string, postPolicyForm PostPolicyForm
 		// If the current policy condition is known
 		if startsWithSupported, condFound := startsWithConds[cond]; condFound {
 			// Check if the current condition supports starts-with operator
-			if op == "starts-with" && !startsWithSupported {
+			if op == policyCondStartsWith && !startsWithSupported {
 				return ErrAccessDenied
 			}
 			// Check if current policy condition is satisfied
-			condPassed = checkPolicyCond(op, formValues[formCanonicalName], v.Value)
+			condPassed = checkPolicyCond(op, formValues.Get(formCanonicalName), v.Value)
 		} else {
 			// This covers all conditions X-Amz-Meta-* and X-Amz-*
 			if strings.HasPrefix(cond, "$x-amz-meta-") || strings.HasPrefix(cond, "$x-amz-") {
 				// Check if policy condition is satisfied
-				condPassed = checkPolicyCond(op, formValues[formCanonicalName], v.Value)
+				condPassed = checkPolicyCond(op, formValues.Get(formCanonicalName), v.Value)
 			}
 		}
 		// Check if current policy condition is satisfied, quit immediately otherwise

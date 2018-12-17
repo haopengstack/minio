@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016 Minio, Inc.
+ * Minio Cloud Storage, (C) 2016, 2017 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"testing"
 	"time"
 )
@@ -35,56 +36,47 @@ func niceError(code APIErrorCode) string {
 
 func TestDoesPolicySignatureMatch(t *testing.T) {
 	credentialTemplate := "%s/%s/%s/s3/aws4_request"
-	now := time.Now().UTC()
-	accessKey := serverConfig.GetCredential().AccessKeyID
+	now := UTCNow()
+	accessKey := globalServerConfig.GetCredential().AccessKey
 
 	testCases := []struct {
-		form     map[string]string
+		form     http.Header
 		expected APIErrorCode
 	}{
 		// (0) It should fail if 'X-Amz-Credential' is missing.
 		{
-			form:     map[string]string{},
+			form:     http.Header{},
 			expected: ErrMissingFields,
 		},
 		// (1) It should fail if the access key is incorrect.
 		{
-			form: map[string]string{
-				"X-Amz-Credential": fmt.Sprintf(credentialTemplate, "EXAMPLEINVALIDEXAMPL", now.Format(yyyymmdd), "us-east-1"),
+			form: http.Header{
+				"X-Amz-Credential": []string{fmt.Sprintf(credentialTemplate, "EXAMPLEINVALIDEXAMPL", now.Format(yyyymmdd), globalMinioDefaultRegion)},
 			},
 			expected: ErrInvalidAccessKeyID,
 		},
-		// (2) It should fail if the region is invalid.
+		// (2) It should fail with a bad signature.
 		{
-			form: map[string]string{
-				"X-Amz-Credential": fmt.Sprintf(credentialTemplate, accessKey, now.Format(yyyymmdd), "invalidregion"),
-			},
-			expected: ErrInvalidRegion,
-		},
-		// (3) It should fail if the date is invalid (or missing, in this case).
-		{
-			form: map[string]string{
-				"X-Amz-Credential": fmt.Sprintf(credentialTemplate, accessKey, now.Format(yyyymmdd), "us-east-1"),
-			},
-			expected: ErrMalformedDate,
-		},
-		// (4) It should fail with a bad signature.
-		{
-			form: map[string]string{
-				"X-Amz-Credential": fmt.Sprintf(credentialTemplate, accessKey, now.Format(yyyymmdd), "us-east-1"),
-				"X-Amz-Date":       now.Format(iso8601Format),
-				"X-Amz-Signature":  "invalidsignature",
-				"Policy":           "policy",
+			form: http.Header{
+				"X-Amz-Credential": []string{fmt.Sprintf(credentialTemplate, accessKey, now.Format(yyyymmdd), globalMinioDefaultRegion)},
+				"X-Amz-Date":       []string{now.Format(iso8601Format)},
+				"X-Amz-Signature":  []string{"invalidsignature"},
+				"Policy":           []string{"policy"},
 			},
 			expected: ErrSignatureDoesNotMatch,
 		},
-		// (5) It should succeed if everything is correct.
+		// (3) It should succeed if everything is correct.
 		{
-			form: map[string]string{
-				"X-Amz-Credential": fmt.Sprintf(credentialTemplate, accessKey, now.Format(yyyymmdd), "us-east-1"),
-				"X-Amz-Date":       now.Format(iso8601Format),
-				"X-Amz-Signature":  getSignature(getSigningKey(serverConfig.GetCredential().SecretAccessKey, now, "us-east-1"), "policy"),
-				"Policy":           "policy",
+			form: http.Header{
+				"X-Amz-Credential": []string{
+					fmt.Sprintf(credentialTemplate, accessKey, now.Format(yyyymmdd), globalMinioDefaultRegion),
+				},
+				"X-Amz-Date": []string{now.Format(iso8601Format)},
+				"X-Amz-Signature": []string{
+					getSignature(getSigningKey(globalServerConfig.GetCredential().SecretKey, now,
+						globalMinioDefaultRegion), "policy"),
+				},
+				"Policy": []string{"policy"},
 			},
 			expected: ErrNone,
 		},
@@ -100,19 +92,22 @@ func TestDoesPolicySignatureMatch(t *testing.T) {
 }
 
 func TestDoesPresignedSignatureMatch(t *testing.T) {
-	rootPath, err := newTestConfig("us-east-1")
+	obj, fsDir, err := prepareFS()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer removeAll(rootPath)
+	defer os.RemoveAll(fsDir)
+	if err = newTestConfig(globalMinioDefaultRegion, obj); err != nil {
+		t.Fatal(err)
+	}
 
 	// sha256 hash of "payload"
 	payloadSHA256 := "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
-	now := time.Now().UTC()
+	now := UTCNow()
 	credentialTemplate := "%s/%s/%s/s3/aws4_request"
 
-	region := serverConfig.GetRegion()
-	accessKeyID := serverConfig.GetCredential().AccessKeyID
+	region := globalServerConfig.GetRegion()
+	accessKeyID := globalServerConfig.GetCredential().AccessKey
 	testCases := []struct {
 		queryParams map[string]string
 		headers     map[string]string
@@ -121,7 +116,7 @@ func TestDoesPresignedSignatureMatch(t *testing.T) {
 	}{
 		// (0) Should error without a set URL query.
 		{
-			region:   "us-east-1",
+			region:   globalMinioDefaultRegion,
 			expected: ErrInvalidQueryParams,
 		},
 		// (1) Should error on an invalid access key.
@@ -137,35 +132,7 @@ func TestDoesPresignedSignatureMatch(t *testing.T) {
 			region:   "us-west-1",
 			expected: ErrInvalidAccessKeyID,
 		},
-		// (2) Should error when the payload sha256 doesn't match.
-		{
-			queryParams: map[string]string{
-				"X-Amz-Algorithm":      signV4Algorithm,
-				"X-Amz-Date":           now.Format(iso8601Format),
-				"X-Amz-Expires":        "60",
-				"X-Amz-Signature":      "badsignature",
-				"X-Amz-SignedHeaders":  "host;x-amz-content-sha256;x-amz-date",
-				"X-Amz-Credential":     fmt.Sprintf(credentialTemplate, accessKeyID, now.Format(yyyymmdd), "us-west-1"),
-				"X-Amz-Content-Sha256": "ThisIsNotThePayloadHash",
-			},
-			region:   "us-west-1",
-			expected: ErrContentSHA256Mismatch,
-		},
-		// (3) Should fail with an invalid region.
-		{
-			queryParams: map[string]string{
-				"X-Amz-Algorithm":      signV4Algorithm,
-				"X-Amz-Date":           now.Format(iso8601Format),
-				"X-Amz-Expires":        "60",
-				"X-Amz-Signature":      "badsignature",
-				"X-Amz-SignedHeaders":  "host;x-amz-content-sha256;x-amz-date",
-				"X-Amz-Credential":     fmt.Sprintf(credentialTemplate, accessKeyID, now.Format(yyyymmdd), "us-west-1"),
-				"X-Amz-Content-Sha256": payloadSHA256,
-			},
-			region:   "us-east-1",
-			expected: ErrInvalidRegion,
-		},
-		// (4) Should NOT fail with an invalid region if it doesn't verify it.
+		// (2) Should NOT fail with an invalid region if it doesn't verify it.
 		{
 			queryParams: map[string]string{
 				"X-Amz-Algorithm":      signV4Algorithm,
@@ -179,7 +146,7 @@ func TestDoesPresignedSignatureMatch(t *testing.T) {
 			region:   "us-west-1",
 			expected: ErrUnsignedHeaders,
 		},
-		// (5) Should fail to extract headers if the host header is not signed.
+		// (3) Should fail to extract headers if the host header is not signed.
 		{
 			queryParams: map[string]string{
 				"X-Amz-Algorithm":      signV4Algorithm,
@@ -193,7 +160,7 @@ func TestDoesPresignedSignatureMatch(t *testing.T) {
 			region:   region,
 			expected: ErrUnsignedHeaders,
 		},
-		// (6) Should give an expired request if it has expired.
+		// (4) Should give an expired request if it has expired.
 		{
 			queryParams: map[string]string{
 				"X-Amz-Algorithm":      signV4Algorithm,
@@ -211,7 +178,7 @@ func TestDoesPresignedSignatureMatch(t *testing.T) {
 			region:   region,
 			expected: ErrExpiredPresignRequest,
 		},
-		// (7) Should error if the signature is incorrect.
+		// (5) Should error if the signature is incorrect.
 		{
 			queryParams: map[string]string{
 				"X-Amz-Algorithm":      signV4Algorithm,
@@ -229,7 +196,7 @@ func TestDoesPresignedSignatureMatch(t *testing.T) {
 			region:   region,
 			expected: ErrSignatureDoesNotMatch,
 		},
-		// (8) Should error if the request is not ready yet, ie X-Amz-Date is in the future.
+		// (6) Should error if the request is not ready yet, ie X-Amz-Date is in the future.
 		{
 			queryParams: map[string]string{
 				"X-Amz-Algorithm":      signV4Algorithm,
@@ -247,7 +214,7 @@ func TestDoesPresignedSignatureMatch(t *testing.T) {
 			region:   region,
 			expected: ErrRequestNotReadyYet,
 		},
-		// (9) Should not error with invalid region instead, call should proceed
+		// (7) Should not error with invalid region instead, call should proceed
 		// with sigature does not match.
 		{
 			queryParams: map[string]string{
@@ -266,7 +233,7 @@ func TestDoesPresignedSignatureMatch(t *testing.T) {
 			region:   "",
 			expected: ErrSignatureDoesNotMatch,
 		},
-		// (10) Should error with signature does not match. But handles
+		// (8) Should error with signature does not match. But handles
 		// query params which do not precede with "x-amz-" header.
 		{
 			queryParams: map[string]string{
@@ -286,7 +253,7 @@ func TestDoesPresignedSignatureMatch(t *testing.T) {
 			region:   "",
 			expected: ErrSignatureDoesNotMatch,
 		},
-		// (11) Should error with unsigned headers.
+		// (9) Should error with unsigned headers.
 		{
 			queryParams: map[string]string{
 				"X-Amz-Algorithm":       signV4Algorithm,

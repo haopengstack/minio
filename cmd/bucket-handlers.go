@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2015, 2016 Minio, Inc.
+ * Minio Cloud Storage, (C) 2015, 2016, 2017, 2018 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,94 +17,115 @@
 package cmd
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/xml"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"path"
+	"path/filepath"
 	"strings"
-	"sync"
 
-	mux "github.com/gorilla/mux"
+	"github.com/gorilla/mux"
+
 	"github.com/minio/minio-go/pkg/set"
+	"github.com/minio/minio/cmd/crypto"
+	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/dns"
+	"github.com/minio/minio/pkg/event"
+	"github.com/minio/minio/pkg/handlers"
+	"github.com/minio/minio/pkg/hash"
+	"github.com/minio/minio/pkg/policy"
+	"github.com/minio/minio/pkg/sync/errgroup"
 )
 
-// http://docs.aws.amazon.com/AmazonS3/latest/dev/using-with-s3-actions.html
-// Enforces bucket policies for a bucket for a given tatusaction.
-func enforceBucketPolicy(bucket string, action string, reqURL *url.URL) (s3Error APIErrorCode) {
-	// Verify if bucket actually exists
-	if err := checkBucketExist(bucket, newObjectLayerFn()); err != nil {
-		err = errorCause(err)
-		switch err.(type) {
-		case BucketNameInvalid:
-			// Return error for invalid bucket name.
-			return ErrInvalidBucketName
-		case BucketNotFound:
-			// For no bucket found we return NoSuchBucket instead.
-			return ErrNoSuchBucket
+// Check if there are buckets on server without corresponding entry in etcd backend and
+// make entries. Here is the general flow
+// - Range over all the available buckets
+// - Check if a bucket has an entry in etcd backend
+// -- If no, make an entry
+// -- If yes, check if the IP of entry matches local IP. This means entry is for this instance.
+// -- If IP of the entry doesn't match, this means entry is for another instance. Log an error to console.
+func initFederatorBackend(objLayer ObjectLayer) {
+	b, err := objLayer.ListBuckets(context.Background())
+	if err != nil {
+		logger.LogIf(context.Background(), err)
+		return
+	}
+
+	g := errgroup.WithNErrs(len(b))
+	for index := range b {
+		index := index
+		g.Go(func() error {
+			r, gerr := globalDNSConfig.Get(b[index].Name)
+			if gerr != nil {
+				if gerr == dns.ErrNoEntriesFound {
+					return globalDNSConfig.Put(b[index].Name)
+				}
+				return gerr
+			}
+			if globalDomainIPs.Intersection(set.CreateStringSet(getHostsSlice(r)...)).IsEmpty() {
+				// There is already an entry for this bucket, with all IP addresses different. This indicates a bucket name collision. Log an error and continue.
+				return fmt.Errorf("Unable to add bucket DNS entry for bucket %s, an entry exists for the same bucket. Use one of these IP addresses %v to access the bucket", b[index].Name, globalDomainIPs.ToSlice())
+			}
+			return nil
+		}, index)
+	}
+
+	for _, err := range g.Wait() {
+		if err != nil {
+			logger.LogIf(context.Background(), err)
+			return
 		}
-		errorIf(err, "Unable to read bucket policy.")
-		// Return internal error for any other errors so that we can investigate.
-		return ErrInternalError
 	}
-
-	// Fetch bucket policy, if policy is not set return access denied.
-	policy := globalBucketPolicies.GetBucketPolicy(bucket)
-	if policy == nil {
-		return ErrAccessDenied
-	}
-
-	// Construct resource in 'arn:aws:s3:::examplebucket/object' format.
-	resource := AWSResourcePrefix + strings.TrimSuffix(strings.TrimPrefix(reqURL.Path, "/"), "/")
-
-	// Get conditions for policy verification.
-	conditionKeyMap := make(map[string]set.StringSet)
-	for queryParam := range reqURL.Query() {
-		conditionKeyMap[queryParam] = set.CreateStringSet(reqURL.Query().Get(queryParam))
-	}
-
-	// Validate action, resource and conditions with current policy statements.
-	if !bucketPolicyEvalStatements(action, resource, conditionKeyMap, policy.Statements) {
-		return ErrAccessDenied
-	}
-	return ErrNone
 }
 
 // GetBucketLocationHandler - GET Bucket location.
 // -------------------------
 // This operation returns bucket location.
 func (api objectAPIHandlers) GetBucketLocationHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "GetBucketLocation")
+
+	defer logger.AuditLog(w, r, "GetBucketLocation", mustGetClaimsFromToken(r))
+
 	vars := mux.Vars(r)
 	bucket := vars["bucket"]
 
 	objectAPI := api.ObjectAPI()
 	if objectAPI == nil {
-		writeErrorResponse(w, r, ErrServerNotInitialized, r.URL.Path)
+		writeErrorResponse(w, ErrServerNotInitialized, r.URL, guessIsBrowserReq(r))
 		return
 	}
 
-	if s3Error := checkRequestAuthType(r, bucket, "s3:GetBucketLocation", "us-east-1"); s3Error != ErrNone {
-		writeErrorResponse(w, r, s3Error, r.URL.Path)
+	if s3Error := checkRequestAuthType(ctx, r, policy.GetBucketLocationAction, bucket, ""); s3Error != ErrNone {
+		writeErrorResponse(w, s3Error, r.URL, guessIsBrowserReq(r))
 		return
 	}
 
-	if _, err := objectAPI.GetBucketInfo(bucket); err != nil {
-		errorIf(err, "Unable to fetch bucket info.")
-		writeErrorResponse(w, r, toAPIErrorCode(err), r.URL.Path)
+	getBucketInfo := objectAPI.GetBucketInfo
+	if api.CacheAPI() != nil {
+		getBucketInfo = api.CacheAPI().GetBucketInfo
+	}
+	if _, err := getBucketInfo(ctx, bucket); err != nil {
+		writeErrorResponse(w, toAPIErrorCode(ctx, err), r.URL, guessIsBrowserReq(r))
 		return
 	}
 
 	// Generate response.
 	encodedSuccessResponse := encodeResponse(LocationResponse{})
 	// Get current region.
-	region := serverConfig.GetRegion()
-	if region != "us-east-1" {
+	region := globalServerConfig.GetRegion()
+	if region != globalMinioDefaultRegion {
 		encodedSuccessResponse = encodeResponse(LocationResponse{
 			Location: region,
 		})
 	}
-	setCommonHeaders(w) // Write headers.
-	writeSuccessResponse(w, encodedSuccessResponse)
+
+	// Write success response.
+	writeSuccessResponseXML(w, encodedSuccessResponse)
 }
 
 // ListMultipartUploadsHandler - GET Bucket (List Multipart uploads)
@@ -116,46 +137,52 @@ func (api objectAPIHandlers) GetBucketLocationHandler(w http.ResponseWriter, r *
 // uploads in the response.
 //
 func (api objectAPIHandlers) ListMultipartUploadsHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "ListMultipartUploads")
+
+	defer logger.AuditLog(w, r, "ListMultipartUploads", mustGetClaimsFromToken(r))
+
 	vars := mux.Vars(r)
 	bucket := vars["bucket"]
 
 	objectAPI := api.ObjectAPI()
 	if objectAPI == nil {
-		writeErrorResponse(w, r, ErrServerNotInitialized, r.URL.Path)
+		writeErrorResponse(w, ErrServerNotInitialized, r.URL, guessIsBrowserReq(r))
 		return
 	}
 
-	if s3Error := checkRequestAuthType(r, bucket, "s3:ListBucketMultipartUploads", serverConfig.GetRegion()); s3Error != ErrNone {
-		writeErrorResponse(w, r, s3Error, r.URL.Path)
+	if s3Error := checkRequestAuthType(ctx, r, policy.ListBucketMultipartUploadsAction, bucket, ""); s3Error != ErrNone {
+		writeErrorResponse(w, s3Error, r.URL, guessIsBrowserReq(r))
 		return
 	}
 
-	prefix, keyMarker, uploadIDMarker, delimiter, maxUploads, _ := getBucketMultipartResources(r.URL.Query())
+	prefix, keyMarker, uploadIDMarker, delimiter, maxUploads, _, s3Error := getBucketMultipartResources(r.URL.Query())
+	if s3Error != ErrNone {
+		writeErrorResponse(w, s3Error, r.URL, guessIsBrowserReq(r))
+		return
+	}
 	if maxUploads < 0 {
-		writeErrorResponse(w, r, ErrInvalidMaxUploads, r.URL.Path)
+		writeErrorResponse(w, ErrInvalidMaxUploads, r.URL, guessIsBrowserReq(r))
 		return
 	}
 	if keyMarker != "" {
 		// Marker not common with prefix is not implemented.
-		if !strings.HasPrefix(keyMarker, prefix) {
-			writeErrorResponse(w, r, ErrNotImplemented, r.URL.Path)
+		if !hasPrefix(keyMarker, prefix) {
+			writeErrorResponse(w, ErrNotImplemented, r.URL, guessIsBrowserReq(r))
 			return
 		}
 	}
 
-	listMultipartsInfo, err := objectAPI.ListMultipartUploads(bucket, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads)
+	listMultipartsInfo, err := objectAPI.ListMultipartUploads(ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads)
 	if err != nil {
-		errorIf(err, "Unable to list multipart uploads.")
-		writeErrorResponse(w, r, toAPIErrorCode(err), r.URL.Path)
+		writeErrorResponse(w, toAPIErrorCode(ctx, err), r.URL, guessIsBrowserReq(r))
 		return
 	}
 	// generate response
 	response := generateListMultipartUploadsResponse(bucket, listMultipartsInfo)
 	encodedSuccessResponse := encodeResponse(response)
-	// write headers.
-	setCommonHeaders(w)
+
 	// write success response.
-	writeSuccessResponse(w, encodedSuccessResponse)
+	writeSuccessResponseXML(w, encodedSuccessResponse)
 }
 
 // ListBucketsHandler - GET Service.
@@ -163,102 +190,151 @@ func (api objectAPIHandlers) ListMultipartUploadsHandler(w http.ResponseWriter, 
 // This implementation of the GET operation returns a list of all buckets
 // owned by the authenticated sender of the request.
 func (api objectAPIHandlers) ListBucketsHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "ListBuckets")
+
+	defer logger.AuditLog(w, r, "ListBuckets", mustGetClaimsFromToken(r))
+
 	objectAPI := api.ObjectAPI()
 	if objectAPI == nil {
-		writeErrorResponse(w, r, ErrServerNotInitialized, r.URL.Path)
+		writeErrorResponse(w, ErrServerNotInitialized, r.URL, guessIsBrowserReq(r))
 		return
+	}
+	listBuckets := objectAPI.ListBuckets
+
+	if api.CacheAPI() != nil {
+		listBuckets = api.CacheAPI().ListBuckets
 	}
 
-	// ListBuckets does not have any bucket action.
-	s3Error := checkRequestAuthType(r, "", "", "us-east-1")
-	if s3Error == ErrInvalidRegion {
-		// Clients like boto3 send listBuckets() call signed with region that is configured.
-		s3Error = checkRequestAuthType(r, "", "", serverConfig.GetRegion())
-	}
-	if s3Error != ErrNone {
-		writeErrorResponse(w, r, s3Error, r.URL.Path)
+	if s3Error := checkRequestAuthType(ctx, r, policy.ListAllMyBucketsAction, "", ""); s3Error != ErrNone {
+		writeErrorResponse(w, s3Error, r.URL, guessIsBrowserReq(r))
 		return
 	}
-	// Invoke the list buckets.
-	bucketsInfo, err := objectAPI.ListBuckets()
-	if err != nil {
-		errorIf(err, "Unable to list buckets.")
-		writeErrorResponse(w, r, toAPIErrorCode(err), r.URL.Path)
-		return
+	// If etcd, dns federation configured list buckets from etcd.
+	var bucketsInfo []BucketInfo
+	if globalDNSConfig != nil {
+		dnsBuckets, err := globalDNSConfig.List()
+		if err != nil && err != dns.ErrNoEntriesFound {
+			writeErrorResponse(w, toAPIErrorCode(ctx, err), r.URL, guessIsBrowserReq(r))
+			return
+		}
+		bucketSet := set.NewStringSet()
+		for _, dnsRecord := range dnsBuckets {
+			if bucketSet.Contains(dnsRecord.Key) {
+				continue
+			}
+			bucketsInfo = append(bucketsInfo, BucketInfo{
+				Name:    strings.Trim(dnsRecord.Key, slashSeparator),
+				Created: dnsRecord.CreationDate,
+			})
+			bucketSet.Add(dnsRecord.Key)
+		}
+	} else {
+		// Invoke the list buckets.
+		var err error
+		bucketsInfo, err = listBuckets(ctx)
+		if err != nil {
+			writeErrorResponse(w, toAPIErrorCode(ctx, err), r.URL, guessIsBrowserReq(r))
+			return
+		}
 	}
 
 	// Generate response.
 	response := generateListBucketsResponse(bucketsInfo)
 	encodedSuccessResponse := encodeResponse(response)
-	// Write headers.
-	setCommonHeaders(w)
+
 	// Write response.
-	writeSuccessResponse(w, encodedSuccessResponse)
+	writeSuccessResponseXML(w, encodedSuccessResponse)
 }
 
 // DeleteMultipleObjectsHandler - deletes multiple objects.
 func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "DeleteMultipleObjects")
+
+	defer logger.AuditLog(w, r, "DeleteMultipleObjects", mustGetClaimsFromToken(r))
+
 	vars := mux.Vars(r)
 	bucket := vars["bucket"]
 
 	objectAPI := api.ObjectAPI()
 	if objectAPI == nil {
-		writeErrorResponse(w, r, ErrServerNotInitialized, r.URL.Path)
+		writeErrorResponse(w, ErrServerNotInitialized, r.URL, guessIsBrowserReq(r))
 		return
 	}
 
-	if s3Error := checkRequestAuthType(r, bucket, "s3:DeleteObject", serverConfig.GetRegion()); s3Error != ErrNone {
-		writeErrorResponse(w, r, s3Error, r.URL.Path)
-		return
+	var s3Error APIErrorCode
+	if s3Error = checkRequestAuthType(ctx, r, policy.DeleteObjectAction, bucket, ""); s3Error != ErrNone {
+		// In the event access is denied, a 200 response should still be returned
+		// http://docs.aws.amazon.com/AmazonS3/latest/API/multiobjectdeleteapi.html
+		if s3Error != ErrAccessDenied {
+			writeErrorResponse(w, s3Error, r.URL, guessIsBrowserReq(r))
+			return
+		}
 	}
 
 	// Content-Length is required and should be non-zero
 	// http://docs.aws.amazon.com/AmazonS3/latest/API/multiobjectdeleteapi.html
 	if r.ContentLength <= 0 {
-		writeErrorResponse(w, r, ErrMissingContentLength, r.URL.Path)
+		writeErrorResponse(w, ErrMissingContentLength, r.URL, guessIsBrowserReq(r))
 		return
 	}
 
 	// Content-Md5 is requied should be set
 	// http://docs.aws.amazon.com/AmazonS3/latest/API/multiobjectdeleteapi.html
 	if _, ok := r.Header["Content-Md5"]; !ok {
-		writeErrorResponse(w, r, ErrMissingContentMD5, r.URL.Path)
+		writeErrorResponse(w, ErrMissingContentMD5, r.URL, guessIsBrowserReq(r))
 		return
 	}
 
 	// Allocate incoming content length bytes.
-	deleteXMLBytes := make([]byte, r.ContentLength)
+	var deleteXMLBytes []byte
+	const maxBodySize = 2 * 1000 * 1024 // The max. XML contains 1000 object names (each at most 1024 bytes long) + XML overhead
+	if r.ContentLength > maxBodySize {  // Only allocated memory for at most 1000 objects
+		deleteXMLBytes = make([]byte, maxBodySize)
+	} else {
+		deleteXMLBytes = make([]byte, r.ContentLength)
+	}
 
 	// Read incoming body XML bytes.
 	if _, err := io.ReadFull(r.Body, deleteXMLBytes); err != nil {
-		errorIf(err, "Unable to read HTTP body.")
-		writeErrorResponse(w, r, ErrInternalError, r.URL.Path)
+		logger.LogIf(ctx, err)
+		writeErrorResponse(w, ErrInternalError, r.URL, guessIsBrowserReq(r))
 		return
 	}
 
 	// Unmarshal list of keys to be deleted.
 	deleteObjects := &DeleteObjectsRequest{}
 	if err := xml.Unmarshal(deleteXMLBytes, deleteObjects); err != nil {
-		errorIf(err, "Unable to unmarshal delete objects request XML.")
-		writeErrorResponse(w, r, ErrMalformedXML, r.URL.Path)
+		logger.LogIf(ctx, err)
+		writeErrorResponse(w, ErrMalformedXML, r.URL, guessIsBrowserReq(r))
 		return
 	}
 
-	var wg = &sync.WaitGroup{} // Allocate a new wait group.
-	var dErrs = make([]error, len(deleteObjects.Objects))
-
-	// Delete all requested objects in parallel.
-	for index, object := range deleteObjects.Objects {
-		wg.Add(1)
-		go func(i int, obj ObjectIdentifier) {
-			defer wg.Done()
-			dErr := objectAPI.DeleteObject(bucket, obj.ObjectName)
-			if dErr != nil {
-				dErrs[i] = dErr
-			}
-		}(index, object)
+	// Deny if WORM is enabled
+	if globalWORMEnabled {
+		// Not required to check whether given objects exist or not, because
+		// DeleteMultipleObject is always successful irrespective of object existence.
+		writeErrorResponse(w, ErrMethodNotAllowed, r.URL, guessIsBrowserReq(r))
+		return
 	}
-	wg.Wait()
+
+	deleteObject := objectAPI.DeleteObject
+	if api.CacheAPI() != nil {
+		deleteObject = api.CacheAPI().DeleteObject
+	}
+
+	var dErrs = make([]error, len(deleteObjects.Objects))
+	for index, object := range deleteObjects.Objects {
+		// If the request is denied access, each item
+		// should be marked as 'AccessDenied'
+		if s3Error == ErrAccessDenied {
+			dErrs[index] = PrefixAccessDenied{
+				Bucket: bucket,
+				Object: object.ObjectName,
+			}
+			continue
+		}
+		dErrs[index] = deleteObject(ctx, bucket, object.ObjectName)
+	}
 
 	// Collect deleted objects and errors if any.
 	var deletedObjects []ObjectIdentifier
@@ -270,17 +346,16 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 			deletedObjects = append(deletedObjects, object)
 			continue
 		}
-		if _, ok := errorCause(err).(ObjectNotFound); ok {
+		if _, ok := err.(ObjectNotFound); ok {
 			// If the object is not found it should be
 			// accounted as deleted as per S3 spec.
 			deletedObjects = append(deletedObjects, object)
 			continue
 		}
-		errorIf(err, "Unable to delete object. %s", object.ObjectName)
 		// Error during delete should be collected separately.
 		deleteErrors = append(deleteErrors, DeleteError{
-			Code:    errorCodeResponse[toAPIErrorCode(err)].Code,
-			Message: errorCodeResponse[toAPIErrorCode(err)].Description,
+			Code:    errorCodeResponse[toAPIErrorCode(ctx, err)].Code,
+			Message: errorCodeResponse[toAPIErrorCode(ctx, err)].Description,
 			Key:     object.ObjectName,
 		})
 	}
@@ -288,22 +363,30 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 	// Generate response
 	response := generateMultiDeleteResponse(deleteObjects.Quiet, deletedObjects, deleteErrors)
 	encodedSuccessResponse := encodeResponse(response)
-	// Write headers
-	setCommonHeaders(w)
+
 	// Write success response.
-	writeSuccessResponse(w, encodedSuccessResponse)
+	writeSuccessResponseXML(w, encodedSuccessResponse)
+
+	// Get host and port from Request.RemoteAddr failing which
+	// fill them with empty strings.
+	host, port, err := net.SplitHostPort(handlers.GetSourceIP(r))
+	if err != nil {
+		host, port = "", ""
+	}
 
 	// Notify deleted event for objects.
 	for _, dobj := range deletedObjects {
-		eventNotify(eventData{
-			Type:   ObjectRemovedDelete,
-			Bucket: bucket,
-			ObjInfo: ObjectInfo{
+		sendEvent(eventArgs{
+			EventName:  event.ObjectRemovedDelete,
+			BucketName: bucket,
+			Object: ObjectInfo{
 				Name: dobj.ObjectName,
 			},
-			ReqParams: map[string]string{
-				"sourceIPAddress": r.RemoteAddr,
-			},
+			ReqParams:    extractReqParams(r),
+			RespElements: extractRespElements(w),
+			UserAgent:    r.UserAgent(),
+			Host:         host,
+			Port:         port,
 		})
 	}
 }
@@ -312,42 +395,77 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 // ----------
 // This implementation of the PUT operation creates a new bucket for authenticated request
 func (api objectAPIHandlers) PutBucketHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "PutBucket")
+
+	defer logger.AuditLog(w, r, "PutBucket", mustGetClaimsFromToken(r))
+
 	objectAPI := api.ObjectAPI()
 	if objectAPI == nil {
-		writeErrorResponse(w, r, ErrServerNotInitialized, r.URL.Path)
-		return
-	}
-
-	// PutBucket does not have any bucket action.
-	if s3Error := checkRequestAuthType(r, "", "", "us-east-1"); s3Error != ErrNone {
-		writeErrorResponse(w, r, s3Error, r.URL.Path)
+		writeErrorResponse(w, ErrServerNotInitialized, r.URL, guessIsBrowserReq(r))
 		return
 	}
 
 	vars := mux.Vars(r)
 	bucket := vars["bucket"]
 
-	// Validate if incoming location constraint is valid, reject
-	// requests which do not follow valid region requirements.
-	if s3Error := isValidLocationConstraint(r); s3Error != ErrNone {
-		writeErrorResponse(w, r, s3Error, r.URL.Path)
+	if s3Error := checkRequestAuthType(ctx, r, policy.CreateBucketAction, bucket, ""); s3Error != ErrNone {
+		writeErrorResponse(w, s3Error, r.URL, guessIsBrowserReq(r))
 		return
 	}
 
-	bucketLock := globalNSMutex.NewNSLock(bucket, "")
-	bucketLock.Lock()
-	defer bucketLock.Unlock()
+	// Parse incoming location constraint.
+	location, s3Error := parseLocationConstraint(r)
+	if s3Error != ErrNone {
+		writeErrorResponse(w, s3Error, r.URL, guessIsBrowserReq(r))
+		return
+	}
+
+	// Validate if location sent by the client is valid, reject
+	// requests which do not follow valid region requirements.
+	if !isValidLocation(location) {
+		writeErrorResponse(w, ErrInvalidRegion, r.URL, guessIsBrowserReq(r))
+		return
+	}
+
+	if globalDNSConfig != nil {
+		if _, err := globalDNSConfig.Get(bucket); err != nil {
+			if err == dns.ErrNoEntriesFound {
+				// Proceed to creating a bucket.
+				if err = objectAPI.MakeBucketWithLocation(ctx, bucket, location); err != nil {
+					writeErrorResponse(w, toAPIErrorCode(ctx, err), r.URL, guessIsBrowserReq(r))
+					return
+				}
+				if err = globalDNSConfig.Put(bucket); err != nil {
+					objectAPI.DeleteBucket(ctx, bucket)
+					writeErrorResponse(w, toAPIErrorCode(ctx, err), r.URL, guessIsBrowserReq(r))
+					return
+				}
+
+				// Make sure to add Location information here only for bucket
+				w.Header().Set("Location", getObjectLocation(r, globalDomainName, bucket, ""))
+
+				writeSuccessResponseHeadersOnly(w)
+				return
+			}
+			writeErrorResponse(w, toAPIErrorCode(ctx, err), r.URL, guessIsBrowserReq(r))
+			return
+
+		}
+		writeErrorResponse(w, ErrBucketAlreadyOwnedByYou, r.URL, guessIsBrowserReq(r))
+		return
+	}
 
 	// Proceed to creating a bucket.
-	err := objectAPI.MakeBucket(bucket)
+	err := objectAPI.MakeBucketWithLocation(ctx, bucket, location)
 	if err != nil {
-		errorIf(err, "Unable to create a bucket.")
-		writeErrorResponse(w, r, toAPIErrorCode(err), r.URL.Path)
+		writeErrorResponse(w, toAPIErrorCode(ctx, err), r.URL, guessIsBrowserReq(r))
 		return
 	}
+
 	// Make sure to add Location information here only for bucket
-	w.Header().Set("Location", getLocation(r))
-	writeSuccessResponse(w, nil)
+	w.Header().Set("Location", path.Clean(r.URL.Path)) // Clean any trailing slashes.
+
+	writeSuccessResponseHeadersOnly(w)
 }
 
 // PostPolicyBucketHandler - POST policy
@@ -355,9 +473,39 @@ func (api objectAPIHandlers) PutBucketHandler(w http.ResponseWriter, r *http.Req
 // This implementation of the POST operation handles object creation with a specified
 // signature policy in multipart/form-data
 func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "PostPolicyBucket")
+
+	defer logger.AuditLog(w, r, "PostPolicyBucket", mustGetClaimsFromToken(r))
+
 	objectAPI := api.ObjectAPI()
 	if objectAPI == nil {
-		writeErrorResponse(w, r, ErrServerNotInitialized, r.URL.Path)
+		writeErrorResponse(w, ErrServerNotInitialized, r.URL, guessIsBrowserReq(r))
+		return
+	}
+	if crypto.S3KMS.IsRequested(r.Header) { // SSE-KMS is not supported
+		writeErrorResponse(w, ErrNotImplemented, r.URL, guessIsBrowserReq(r))
+		return
+	}
+	if !objectAPI.IsEncryptionSupported() && hasServerSideEncryptionHeader(r.Header) {
+		writeErrorResponse(w, ErrNotImplemented, r.URL, guessIsBrowserReq(r))
+		return
+	}
+	bucket := mux.Vars(r)["bucket"]
+
+	// Require Content-Length to be set in the request
+	size := r.ContentLength
+	if size < 0 {
+		writeErrorResponse(w, ErrMissingContentLength, r.URL, guessIsBrowserReq(r))
+		return
+	}
+	resource, err := getResource(r.URL.Path, r.Host, globalDomainName)
+	if err != nil {
+		writeErrorResponse(w, ErrInvalidRequest, r.URL, guessIsBrowserReq(r))
+		return
+	}
+	// Make sure that the URL  does not contain object name.
+	if bucket != filepath.Clean(resource[1:]) {
+		writeErrorResponse(w, ErrMethodNotAllowed, r.URL, guessIsBrowserReq(r))
 		return
 	}
 
@@ -365,104 +513,199 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 	// be loaded in memory, the remaining being put in temporary files.
 	reader, err := r.MultipartReader()
 	if err != nil {
-		errorIf(err, "Unable to initialize multipart reader.")
-		writeErrorResponse(w, r, ErrMalformedPOSTRequest, r.URL.Path)
+		logger.LogIf(ctx, err)
+		writeErrorResponse(w, ErrMalformedPOSTRequest, r.URL, guessIsBrowserReq(r))
 		return
 	}
 
-	fileBody, fileName, formValues, err := extractPostPolicyFormValues(reader)
+	// Read multipart data and save in memory and in the disk if needed
+	form, err := reader.ReadForm(maxFormMemory)
 	if err != nil {
-		errorIf(err, "Unable to parse form values.")
-		writeErrorResponse(w, r, ErrMalformedPOSTRequest, r.URL.Path)
+		logger.LogIf(ctx, err)
+		writeErrorResponse(w, ErrMalformedPOSTRequest, r.URL, guessIsBrowserReq(r))
 		return
 	}
-	bucket := mux.Vars(r)["bucket"]
-	formValues["Bucket"] = bucket
 
-	if fileName != "" && strings.Contains(formValues["Key"], "${filename}") {
+	// Remove all tmp files creating during multipart upload
+	defer form.RemoveAll()
+
+	// Extract all form fields
+	fileBody, fileName, fileSize, formValues, err := extractPostPolicyFormValues(ctx, form)
+	if err != nil {
+		logger.LogIf(ctx, err)
+		writeErrorResponse(w, ErrMalformedPOSTRequest, r.URL, guessIsBrowserReq(r))
+		return
+	}
+
+	// Check if file is provided, error out otherwise.
+	if fileBody == nil {
+		writeErrorResponse(w, ErrPOSTFileRequired, r.URL, guessIsBrowserReq(r))
+		return
+	}
+
+	// Close multipart file
+	defer fileBody.Close()
+
+	formValues.Set("Bucket", bucket)
+
+	if fileName != "" && strings.Contains(formValues.Get("Key"), "${filename}") {
 		// S3 feature to replace ${filename} found in Key form field
 		// by the filename attribute passed in multipart
-		formValues["Key"] = strings.Replace(formValues["Key"], "${filename}", fileName, -1)
+		formValues.Set("Key", strings.Replace(formValues.Get("Key"), "${filename}", fileName, -1))
 	}
-	object := formValues["Key"]
+	object := formValues.Get("Key")
+
+	successRedirect := formValues.Get("success_action_redirect")
+	successStatus := formValues.Get("success_action_status")
+	var redirectURL *url.URL
+	if successRedirect != "" {
+		redirectURL, err = url.Parse(successRedirect)
+		if err != nil {
+			writeErrorResponse(w, ErrMalformedPOSTRequest, r.URL, guessIsBrowserReq(r))
+			return
+		}
+	}
 
 	// Verify policy signature.
 	apiErr := doesPolicySignatureMatch(formValues)
 	if apiErr != ErrNone {
-		writeErrorResponse(w, r, apiErr, r.URL.Path)
+		writeErrorResponse(w, apiErr, r.URL, guessIsBrowserReq(r))
 		return
 	}
 
-	policyBytes, err := base64.StdEncoding.DecodeString(formValues["Policy"])
+	policyBytes, err := base64.StdEncoding.DecodeString(formValues.Get("Policy"))
 	if err != nil {
-		writeErrorResponse(w, r, ErrMalformedPOSTRequest, r.URL.Path)
+		writeErrorResponse(w, ErrMalformedPOSTRequest, r.URL, guessIsBrowserReq(r))
 		return
 	}
 
-	postPolicyForm, err := parsePostPolicyForm(string(policyBytes))
-	if err != nil {
-		writeErrorResponse(w, r, ErrMalformedPOSTRequest, r.URL.Path)
-		return
-	}
-
-	// Make sure formValues adhere to policy restrictions.
-	if apiErr = checkPostPolicy(formValues, postPolicyForm); apiErr != ErrNone {
-		writeErrorResponse(w, r, apiErr, r.URL.Path)
-		return
-	}
-
-	// Use rangeReader to ensure that object size is within expected range.
-	lengthRange := postPolicyForm.Conditions.ContentLengthRange
-	if lengthRange.Valid {
-		// If policy restricted the size of the object.
-		fileBody = &rangeReader{
-			Reader: fileBody,
-			Min:    lengthRange.Min,
-			Max:    lengthRange.Max,
+	// Handle policy if it is set.
+	if len(policyBytes) > 0 {
+		postPolicyForm, err := parsePostPolicyForm(string(policyBytes))
+		if err != nil {
+			writeErrorResponse(w, ErrMalformedPOSTRequest, r.URL, guessIsBrowserReq(r))
+			return
 		}
-	} else {
-		// Default values of min/max size of the object.
-		fileBody = &rangeReader{
-			Reader: fileBody,
-			Min:    0,
-			Max:    maxObjectSize,
+
+		// Make sure formValues adhere to policy restrictions.
+		if apiErr = checkPostPolicy(formValues, postPolicyForm); apiErr != ErrNone {
+			writeErrorResponse(w, apiErr, r.URL, guessIsBrowserReq(r))
+			return
+		}
+
+		// Ensure that the object size is within expected range, also the file size
+		// should not exceed the maximum single Put size (5 GiB)
+		lengthRange := postPolicyForm.Conditions.ContentLengthRange
+		if lengthRange.Valid {
+			if fileSize < lengthRange.Min {
+				writeErrorResponse(w, toAPIErrorCode(ctx, errDataTooSmall), r.URL, guessIsBrowserReq(r))
+				return
+			}
+
+			if fileSize > lengthRange.Max || isMaxObjectSize(fileSize) {
+				writeErrorResponse(w, toAPIErrorCode(ctx, errDataTooLarge), r.URL, guessIsBrowserReq(r))
+				return
+			}
 		}
 	}
 
-	// Save metadata.
+	// Extract metadata to be saved from received Form.
 	metadata := make(map[string]string)
-	// Nothing to store right now.
-
-	sha256sum := ""
-
-	objectLock := globalNSMutex.NewNSLock(bucket, object)
-	objectLock.Lock()
-	defer objectLock.Unlock()
-
-	objInfo, err := objectAPI.PutObject(bucket, object, -1, fileBody, metadata, sha256sum)
+	err = extractMetadataFromMap(ctx, formValues, metadata)
 	if err != nil {
-		errorIf(err, "Unable to create object.")
-		writeErrorResponse(w, r, toAPIErrorCode(err), r.URL.Path)
+		writeErrorResponse(w, ErrInternalError, r.URL, guessIsBrowserReq(r))
 		return
 	}
-	w.Header().Set("ETag", "\""+objInfo.MD5Sum+"\"")
-	w.Header().Set("Location", getObjectLocation(bucket, object))
 
-	// Set common headers.
-	setCommonHeaders(w)
+	hashReader, err := hash.NewReader(fileBody, fileSize, "", "", fileSize)
+	if err != nil {
+		logger.LogIf(ctx, err)
+		writeErrorResponse(w, toAPIErrorCode(ctx, err), r.URL, guessIsBrowserReq(r))
+		return
+	}
+	rawReader := hashReader
+	pReader := NewPutObjReader(rawReader, nil, nil)
+	var objectEncryptionKey []byte
 
-	// Write successful response.
-	writeSuccessNoContent(w)
+	if globalAutoEncryption && !crypto.SSEC.IsRequested(r.Header) {
+		r.Header.Add(crypto.SSEHeader, crypto.SSEAlgorithmAES256)
+	}
+	if objectAPI.IsEncryptionSupported() {
+		if hasServerSideEncryptionHeader(formValues) && !hasSuffix(object, slashSeparator) { // handle SSE-C and SSE-S3 requests
+			var reader io.Reader
+			var key []byte
+			if crypto.SSEC.IsRequested(formValues) {
+				key, err = ParseSSECustomerHeader(formValues)
+				if err != nil {
+					writeErrorResponse(w, toAPIErrorCode(ctx, err), r.URL, guessIsBrowserReq(r))
+					return
+				}
+			}
+			reader, objectEncryptionKey, err = newEncryptReader(hashReader, key, bucket, object, metadata, crypto.S3.IsRequested(formValues))
+			if err != nil {
+				writeErrorResponse(w, toAPIErrorCode(ctx, err), r.URL, guessIsBrowserReq(r))
+				return
+			}
+			info := ObjectInfo{Size: fileSize}
+			hashReader, err = hash.NewReader(reader, info.EncryptedSize(), "", "", fileSize) // do not try to verify encrypted content
+			if err != nil {
+				writeErrorResponse(w, toAPIErrorCode(ctx, err), r.URL, guessIsBrowserReq(r))
+				return
+			}
+			pReader = NewPutObjReader(rawReader, hashReader, objectEncryptionKey)
+		}
+	}
+
+	objInfo, err := objectAPI.PutObject(ctx, bucket, object, pReader, metadata, ObjectOptions{})
+	if err != nil {
+		writeErrorResponse(w, toAPIErrorCode(ctx, err), r.URL, guessIsBrowserReq(r))
+		return
+	}
+
+	location := getObjectLocation(r, globalDomainName, bucket, object)
+	w.Header().Set("ETag", `"`+objInfo.ETag+`"`)
+	w.Header().Set("Location", location)
+
+	// Get host and port from Request.RemoteAddr.
+	host, port, err := net.SplitHostPort(handlers.GetSourceIP(r))
+	if err != nil {
+		host, port = "", ""
+	}
 
 	// Notify object created event.
-	eventNotify(eventData{
-		Type:    ObjectCreatedPost,
-		Bucket:  bucket,
-		ObjInfo: objInfo,
-		ReqParams: map[string]string{
-			"sourceIPAddress": r.RemoteAddr,
-		},
+	defer sendEvent(eventArgs{
+		EventName:    event.ObjectCreatedPost,
+		BucketName:   objInfo.Bucket,
+		Object:       objInfo,
+		ReqParams:    extractReqParams(r),
+		RespElements: extractRespElements(w),
+		UserAgent:    r.UserAgent(),
+		Host:         host,
+		Port:         port,
 	})
+
+	if successRedirect != "" {
+		// Replace raw query params..
+		redirectURL.RawQuery = getRedirectPostRawQuery(objInfo)
+		writeRedirectSeeOther(w, redirectURL.String())
+		return
+	}
+
+	// Decide what http response to send depending on success_action_status parameter
+	switch successStatus {
+	case "201":
+		resp := encodeResponse(PostResponse{
+			Bucket:   objInfo.Bucket,
+			Key:      objInfo.Name,
+			ETag:     `"` + objInfo.ETag + `"`,
+			Location: location,
+		})
+		writeResponse(w, http.StatusCreated, resp, "application/xml")
+	case "200":
+		writeSuccessResponseHeadersOnly(w)
+	default:
+		writeSuccessNoContent(w)
+	}
 }
 
 // HeadBucketHandler - HEAD Bucket
@@ -472,68 +715,78 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 // have permission to access it. Otherwise, the operation might
 // return responses such as 404 Not Found and 403 Forbidden.
 func (api objectAPIHandlers) HeadBucketHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "HeadBucket")
+
+	defer logger.AuditLog(w, r, "HeadBucket", mustGetClaimsFromToken(r))
+
 	vars := mux.Vars(r)
 	bucket := vars["bucket"]
 
 	objectAPI := api.ObjectAPI()
 	if objectAPI == nil {
-		writeErrorResponse(w, r, ErrServerNotInitialized, r.URL.Path)
+		writeErrorResponseHeadersOnly(w, ErrServerNotInitialized)
 		return
 	}
 
-	if s3Error := checkRequestAuthType(r, bucket, "s3:ListBucket", serverConfig.GetRegion()); s3Error != ErrNone {
-		writeErrorResponse(w, r, s3Error, r.URL.Path)
+	if s3Error := checkRequestAuthType(ctx, r, policy.ListBucketAction, bucket, ""); s3Error != ErrNone {
+		writeErrorResponseHeadersOnly(w, s3Error)
 		return
 	}
 
-	bucketLock := globalNSMutex.NewNSLock(bucket, "")
-	bucketLock.RLock()
-	defer bucketLock.RUnlock()
-
-	if _, err := objectAPI.GetBucketInfo(bucket); err != nil {
-		errorIf(err, "Unable to fetch bucket info.")
-		writeErrorResponse(w, r, toAPIErrorCode(err), r.URL.Path)
+	getBucketInfo := objectAPI.GetBucketInfo
+	if api.CacheAPI() != nil {
+		getBucketInfo = api.CacheAPI().GetBucketInfo
+	}
+	if _, err := getBucketInfo(ctx, bucket); err != nil {
+		writeErrorResponseHeadersOnly(w, toAPIErrorCode(ctx, err))
 		return
 	}
-	writeSuccessResponse(w, nil)
+
+	writeSuccessResponseHeadersOnly(w)
 }
 
 // DeleteBucketHandler - Delete bucket
 func (api objectAPIHandlers) DeleteBucketHandler(w http.ResponseWriter, r *http.Request) {
-	objectAPI := api.ObjectAPI()
-	if objectAPI == nil {
-		writeErrorResponse(w, r, ErrServerNotInitialized, r.URL.Path)
-		return
-	}
+	ctx := newContext(r, w, "DeleteBucket")
 
-	// DeleteBucket does not have any bucket action.
-	if s3Error := checkRequestAuthType(r, "", "", serverConfig.GetRegion()); s3Error != ErrNone {
-		writeErrorResponse(w, r, s3Error, r.URL.Path)
-		return
-	}
+	defer logger.AuditLog(w, r, "DeleteBucket", mustGetClaimsFromToken(r))
 
 	vars := mux.Vars(r)
 	bucket := vars["bucket"]
 
-	bucketLock := globalNSMutex.NewNSLock(bucket, "")
-	bucketLock.Lock()
-	defer bucketLock.Unlock()
-
-	// Attempt to delete bucket.
-	if err := objectAPI.DeleteBucket(bucket); err != nil {
-		errorIf(err, "Unable to delete a bucket.")
-		writeErrorResponse(w, r, toAPIErrorCode(err), r.URL.Path)
+	objectAPI := api.ObjectAPI()
+	if objectAPI == nil {
+		writeErrorResponse(w, ErrServerNotInitialized, r.URL, guessIsBrowserReq(r))
 		return
 	}
 
-	// Delete bucket access policy, if present - ignore any errors.
-	_ = removeBucketPolicy(bucket, objectAPI)
+	if s3Error := checkRequestAuthType(ctx, r, policy.DeleteBucketAction, bucket, ""); s3Error != ErrNone {
+		writeErrorResponse(w, s3Error, r.URL, guessIsBrowserReq(r))
+		return
+	}
 
-	// Delete notification config, if present - ignore any errors.
-	_ = removeNotificationConfig(bucket, objectAPI)
+	deleteBucket := objectAPI.DeleteBucket
+	if api.CacheAPI() != nil {
+		deleteBucket = api.CacheAPI().DeleteBucket
+	}
+	// Attempt to delete bucket.
+	if err := deleteBucket(ctx, bucket); err != nil {
+		writeErrorResponse(w, toAPIErrorCode(ctx, err), r.URL, guessIsBrowserReq(r))
+		return
+	}
 
-	// Delete listener config, if present - ignore any errors.
-	_ = removeListenerConfig(bucket, objectAPI)
+	globalNotificationSys.RemoveNotification(bucket)
+	globalPolicySys.Remove(bucket)
+	globalNotificationSys.DeleteBucket(ctx, bucket)
+
+	if globalDNSConfig != nil {
+		if err := globalDNSConfig.Delete(bucket); err != nil {
+			// Deleting DNS entry failed, attempt to create the bucket again.
+			objectAPI.MakeBucketWithLocation(ctx, bucket, "")
+			writeErrorResponse(w, toAPIErrorCode(ctx, err), r.URL, guessIsBrowserReq(r))
+			return
+		}
+	}
 
 	// Write success response.
 	writeSuccessNoContent(w)

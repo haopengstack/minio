@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2015 Minio, Inc.
+ * Minio Cloud Storage, (C) 2015, 2016, 2017, 2018 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,7 +17,6 @@
 package cmd
 
 import (
-	"errors"
 	"fmt"
 	"io"
 )
@@ -26,11 +25,6 @@ import (
 // handle all cases where we have known types of errors returned by
 // underlying storage layer.
 func toObjectErr(err error, params ...string) error {
-	e, ok := err.(*Error)
-	if ok {
-		err = e.e
-	}
-
 	switch err {
 	case errVolumeNotFound:
 		if len(params) >= 1 {
@@ -53,7 +47,7 @@ func toObjectErr(err error, params ...string) error {
 				Object: params[1],
 			}
 		}
-	case errIsNotRegular, errFileAccessDenied:
+	case errIsNotRegular:
 		if len(params) >= 2 {
 			err = ObjectExistsAsDirectory{
 				Bucket: params[0],
@@ -94,21 +88,15 @@ func toObjectErr(err error, params ...string) error {
 		err = InsufficientWriteQuorum{}
 	case io.ErrUnexpectedEOF, io.ErrShortWrite:
 		err = IncompleteBody{}
-	case errContentSHA256Mismatch:
-		err = SHA256Mismatch{}
-	}
-	if ok {
-		e.e = err
-		return e
 	}
 	return err
 }
 
-// SHA256Mismatch - when content sha256 does not match with what was sent from client.
-type SHA256Mismatch struct{}
+// SignatureDoesNotMatch - when content md5 does not match with what was sent from client.
+type SignatureDoesNotMatch struct{}
 
-func (e SHA256Mismatch) Error() string {
-	return "sha256 computed does not match with what is expected"
+func (e SignatureDoesNotMatch) Error() string {
+	return "The request signature we calculated does not match the signature you provided. Check your key and signing method."
 }
 
 // StorageFull storage ran out of space.
@@ -145,6 +133,20 @@ func (e BucketNotFound) Error() string {
 	return "Bucket not found: " + e.Bucket
 }
 
+// BucketAlreadyExists the requested bucket name is not available.
+type BucketAlreadyExists GenericError
+
+func (e BucketAlreadyExists) Error() string {
+	return "The requested bucket name is not available. The bucket namespace is shared by all users of the system. Please select a different name and try again."
+}
+
+// BucketAlreadyOwnedByYou already owned by you.
+type BucketAlreadyOwnedByYou GenericError
+
+func (e BucketAlreadyOwnedByYou) Error() string {
+	return "Bucket already owned by you: " + e.Bucket
+}
+
 // BucketNotEmpty bucket is not empty.
 type BucketNotEmpty GenericError
 
@@ -157,6 +159,13 @@ type ObjectNotFound GenericError
 
 func (e ObjectNotFound) Error() string {
 	return "Object not found: " + e.Bucket + "#" + e.Object
+}
+
+// ObjectAlreadyExists object already exists.
+type ObjectAlreadyExists GenericError
+
+func (e ObjectAlreadyExists) Error() string {
+	return "Object: " + e.Bucket + "#" + e.Object + " already exists"
 }
 
 // ObjectExistsAsDirectory object already exists as a directory.
@@ -178,16 +187,6 @@ type BucketExists GenericError
 
 func (e BucketExists) Error() string {
 	return "Bucket exists: " + e.Bucket
-}
-
-// BadDigest - Content-MD5 you specified did not match what we received.
-type BadDigest struct {
-	ExpectedMD5   string
-	CalculatedMD5 string
-}
-
-func (e BadDigest) Error() string {
-	return "Bad digest: Expected " + e.ExpectedMD5 + " is not valid with what we calculated " + e.CalculatedMD5
 }
 
 // UnsupportedDelimiter - unsupported delimiter.
@@ -244,6 +243,14 @@ func (e ObjectNameInvalid) Error() string {
 	return "Object name invalid: " + e.Bucket + "#" + e.Object
 }
 
+// AllAccessDisabled All access to this object has been disabled
+type AllAccessDisabled GenericError
+
+// Return string an error formatted as the given text.
+func (e AllAccessDisabled) Error() string {
+	return "All access to this object has been disabled"
+}
+
 // IncompleteBody You did not provide the number of bytes specified by the Content-Length HTTP header.
 type IncompleteBody GenericError
 
@@ -252,18 +259,15 @@ func (e IncompleteBody) Error() string {
 	return e.Bucket + "#" + e.Object + "has incomplete body"
 }
 
-// errInvalidRange - returned when given range value is not valid.
-var errInvalidRange = errors.New("Invalid range")
-
 // InvalidRange - invalid range typed error.
 type InvalidRange struct {
-	offsetBegin  int64
-	offsetEnd    int64
-	resourceSize int64
+	OffsetBegin  int64
+	OffsetEnd    int64
+	ResourceSize int64
 }
 
 func (e InvalidRange) Error() string {
-	return fmt.Sprintf("The requested range \"bytes %d-%d/%d\" is not satisfiable.", e.offsetBegin, e.offsetEnd, e.resourceSize)
+	return fmt.Sprintf("The requested range \"bytes %d-%d/%d\" is not satisfiable.", e.OffsetBegin, e.OffsetEnd, e.ResourceSize)
 }
 
 // ObjectTooLarge error returned when the size of the object > max object size allowed (5G) per request.
@@ -278,6 +282,15 @@ type ObjectTooSmall GenericError
 
 func (e ObjectTooSmall) Error() string {
 	return "size of the object less than what is expected"
+}
+
+// OperationTimedOut - a timeout occurred.
+type OperationTimedOut struct {
+	Path string
+}
+
+func (e OperationTimedOut) Error() string {
+	return "Operation timed out: " + e.Path
 }
 
 /// Multipart related errors.
@@ -301,10 +314,15 @@ func (e InvalidUploadID) Error() string {
 }
 
 // InvalidPart One or more of the specified parts could not be found
-type InvalidPart struct{}
+type InvalidPart struct {
+	PartNumber int
+	ExpETag    string
+	GotETag    string
+}
 
 func (e InvalidPart) Error() string {
-	return "One or more of the specified parts could not be found"
+	return fmt.Sprintf("Specified part could not be found. PartNumber %d, Expected %s, got %s",
+		e.PartNumber, e.ExpETag, e.GotETag)
 }
 
 // PartTooSmall - error if part size is less than 5MB.
@@ -315,7 +333,21 @@ type PartTooSmall struct {
 }
 
 func (e PartTooSmall) Error() string {
-	return fmt.Sprintf("Part size for %d should be atleast 5MB", e.PartNumber)
+	return fmt.Sprintf("Part size for %d should be at least 5MB", e.PartNumber)
+}
+
+// PartTooBig returned if size of part is bigger than the allowed limit.
+type PartTooBig struct{}
+
+func (e PartTooBig) Error() string {
+	return "Part size bigger than the allowed limit"
+}
+
+// InvalidETag error returned when the etag has changed on disk
+type InvalidETag struct{}
+
+func (e InvalidETag) Error() string {
+	return "etag of the object has changed"
 }
 
 // NotImplemented If a feature is not implemented
@@ -332,42 +364,22 @@ func (e PolicyNesting) Error() string {
 	return "New bucket policy conflicts with an existing policy. Please try again with new prefix."
 }
 
-// Check if error type is IncompleteBody.
-func isErrIncompleteBody(err error) bool {
-	err = errorCause(err)
-	switch err.(type) {
-	case IncompleteBody:
-		return true
-	}
-	return false
+// UnsupportedMetadata - unsupported metadata
+type UnsupportedMetadata struct{}
+
+func (e UnsupportedMetadata) Error() string {
+	return "Unsupported headers in Metadata"
 }
 
-// Check if error type is BucketPolicyNotFound.
-func isErrBucketPolicyNotFound(err error) bool {
-	err = errorCause(err)
-	switch err.(type) {
-	case BucketPolicyNotFound:
-		return true
-	}
-	return false
+// BackendDown is returned for network errors or if the gateway's backend is down.
+type BackendDown struct{}
+
+func (e BackendDown) Error() string {
+	return "Backend down"
 }
 
-// Check if error type is ObjectNameInvalid.
-func isErrObjectNameInvalid(err error) bool {
-	err = errorCause(err)
-	switch err.(type) {
-	case ObjectNameInvalid:
-		return true
-	}
-	return false
-}
-
-// Check if error type is ObjectNotFound.
+// isErrObjectNotFound - Check if error type is ObjectNotFound.
 func isErrObjectNotFound(err error) bool {
-	err = errorCause(err)
-	switch err.(type) {
-	case ObjectNotFound:
-		return true
-	}
-	return false
+	_, ok := err.(ObjectNotFound)
+	return ok
 }

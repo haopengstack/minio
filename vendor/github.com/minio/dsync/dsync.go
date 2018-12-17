@@ -16,55 +16,53 @@
 
 package dsync
 
-import "errors"
+import (
+	"errors"
+	"math"
+)
 
-const RpcPath = "/dsync"
-const DebugPath = "/debug"
+// Dsync represents dsync client object which is initialized with
+// authenticated clients, used to initiate lock RPC calls.
+type Dsync struct {
+	// Number of nodes participating in the distributed locking.
+	dNodeCount int
 
-const DefaultPath = "/rpc/dsync"
+	// List of rpc client objects, one per lock server.
+	rpcClnts []NetLocker
 
-// Number of nodes participating in the distributed locking.
-var dnodeCount int
+	// Index into rpc client array for server running on localhost
+	ownNode int
 
-// List of rpc client objects, one per lock server.
-var clnts []RPC
+	// Simple majority based quorum, set to dNodeCount/2+1
+	dquorum int
 
-// Index into rpc client array for server running on localhost
-var ownNode int
+	// Simple quorum for read operations, set to dNodeCount/2
+	dquorumReads int
+}
 
-// Simple majority based quorum, set to dNodeCount/2+1
-var dquorum int
-
-// Simple quorum for read operations, set to dNodeCount/2
-var dquorumReads int
-
-// SetNodesWithPath - initializes package-level global state variables such as clnts.
-// N B - This function should be called only once inside any program that uses
-// dsync.
-func SetNodesWithClients(rpcClnts []RPC, rpcOwnNode int) (err error) {
-
-	// Validate if number of nodes is within allowable range.
-	if dnodeCount != 0 {
-		return errors.New("Cannot reinitialize dsync package")
-	} else if len(rpcClnts) < 4 {
-		return errors.New("Dsync not designed for less than 4 nodes")
-	} else if len(rpcClnts) > 16 {
-		return errors.New("Dsync not designed for more than 16 nodes")
-	} else if len(rpcClnts)&1 == 1 {
-		return errors.New("Dsync not designed for an uneven number of nodes")
+// New - initializes a new dsync object with input rpcClnts.
+func New(rpcClnts []NetLocker, rpcOwnNode int) (*Dsync, error) {
+	if len(rpcClnts) < 2 {
+		return nil, errors.New("Dsync is not designed for less than 2 nodes")
+	} else if len(rpcClnts) > 32 {
+		return nil, errors.New("Dsync is not designed for more than 32 nodes")
 	}
 
 	if rpcOwnNode > len(rpcClnts) {
-		return errors.New("Index for own node is too large")
+		return nil, errors.New("Index for own node is too large")
 	}
 
-	dnodeCount = len(rpcClnts)
-	dquorum = dnodeCount/2 + 1
-	dquorumReads = dnodeCount / 2
-	// Initialize node name and rpc path for each RPCClient object.
-	clnts = make([]RPC, dnodeCount)
-	copy(clnts, rpcClnts)
+	ds := &Dsync{}
+	ds.dNodeCount = len(rpcClnts)
 
-	ownNode = rpcOwnNode
-	return nil
+	// With odd number of nodes, write and read quorum is basically the same
+	ds.dquorum = int(ds.dNodeCount/2) + 1
+	ds.dquorumReads = int(math.Ceil(float64(ds.dNodeCount) / 2.0))
+	ds.ownNode = rpcOwnNode
+
+	// Initialize node name and rpc path for each NetLocker object.
+	ds.rpcClnts = make([]NetLocker, ds.dNodeCount)
+	copy(ds.rpcClnts, rpcClnts)
+
+	return ds, nil
 }

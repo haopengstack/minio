@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016 Minio, Inc.
+ * Minio Cloud Storage, (C) 2016, 2017 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,266 +17,14 @@
 package cmd
 
 import (
-	"fmt"
+	"bytes"
+	"context"
+	"path/filepath"
 	"testing"
 )
 
-// Tests healing of format XL.
-func TestHealFormatXL(t *testing.T) {
-	root, err := newTestConfig("us-east-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer removeAll(root)
-
-	nDisks := 16
-	fsDirs, err := getRandomDisks(nDisks)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	endpoints, err := parseStorageEndpoints(fsDirs)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Everything is fine, should return nil
-	obj, _, err := initObjectLayer(endpoints)
-	if err != nil {
-		t.Fatal(err)
-	}
-	xl := obj.(*xlObjects)
-	if err = healFormatXL(xl.storageDisks); err != nil {
-		t.Fatal("Got an unexpected error: ", err)
-	}
-
-	removeRoots(fsDirs)
-
-	fsDirs, err = getRandomDisks(nDisks)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	endpoints, err = parseStorageEndpoints(fsDirs)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Disks 0..15 are nil
-	obj, _, err = initObjectLayer(endpoints)
-	if err != nil {
-		t.Fatal(err)
-	}
-	xl = obj.(*xlObjects)
-	for i := 0; i <= 15; i++ {
-		xl.storageDisks[i] = nil
-	}
-
-	if err = healFormatXL(xl.storageDisks); err != errXLReadQuorum {
-		t.Fatal("Got an unexpected error: ", err)
-	}
-	removeRoots(fsDirs)
-
-	fsDirs, err = getRandomDisks(nDisks)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	endpoints, err = parseStorageEndpoints(fsDirs)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// One disk returns Faulty Disk
-	obj, _, err = initObjectLayer(endpoints)
-	if err != nil {
-		t.Fatal(err)
-	}
-	xl = obj.(*xlObjects)
-	for i := range xl.storageDisks {
-		posixDisk, ok := xl.storageDisks[i].(*retryStorage)
-		if !ok {
-			t.Fatal("storage disk is not *retryStorage type")
-		}
-		xl.storageDisks[i] = newNaughtyDisk(posixDisk, nil, errDiskFull)
-	}
-	if err = healFormatXL(xl.storageDisks); err != errXLReadQuorum {
-		t.Fatal("Got an unexpected error: ", err)
-	}
-	removeRoots(fsDirs)
-
-	fsDirs, err = getRandomDisks(nDisks)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	endpoints, err = parseStorageEndpoints(fsDirs)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// One disk is not found, heal corrupted disks should return nil
-	obj, _, err = initObjectLayer(endpoints)
-	if err != nil {
-		t.Fatal(err)
-	}
-	xl = obj.(*xlObjects)
-	xl.storageDisks[0] = nil
-	if err = healFormatXL(xl.storageDisks); err != nil {
-		t.Fatal("Got an unexpected error: ", err)
-	}
-	removeRoots(fsDirs)
-
-	fsDirs, err = getRandomDisks(nDisks)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	endpoints, err = parseStorageEndpoints(fsDirs)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Remove format.json of all disks
-	obj, _, err = initObjectLayer(endpoints)
-	if err != nil {
-		t.Fatal(err)
-	}
-	xl = obj.(*xlObjects)
-	for i := 0; i <= 15; i++ {
-		if err = xl.storageDisks[i].DeleteFile(".minio.sys", "format.json"); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err = healFormatXL(xl.storageDisks); err != nil {
-		t.Fatal("Got an unexpected error: ", err)
-	}
-	removeRoots(fsDirs)
-
-	fsDirs, err = getRandomDisks(nDisks)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	endpoints, err = parseStorageEndpoints(fsDirs)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Corrupted format json in one disk
-	obj, _, err = initObjectLayer(endpoints)
-	if err != nil {
-		t.Fatal(err)
-	}
-	xl = obj.(*xlObjects)
-	for i := 0; i <= 15; i++ {
-		if err = xl.storageDisks[i].AppendFile(".minio.sys", "format.json", []byte("corrupted data")); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err = healFormatXL(xl.storageDisks); err == nil {
-		t.Fatal("Should get a json parsing error, ")
-	}
-	removeRoots(fsDirs)
-
-	fsDirs, err = getRandomDisks(nDisks)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	endpoints, err = parseStorageEndpoints(fsDirs)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Remove format.json on 3 disks.
-	obj, _, err = initObjectLayer(endpoints)
-	if err != nil {
-		t.Fatal(err)
-	}
-	xl = obj.(*xlObjects)
-	for i := 0; i <= 2; i++ {
-		if err = xl.storageDisks[i].DeleteFile(".minio.sys", "format.json"); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err = healFormatXL(xl.storageDisks); err != nil {
-		t.Fatal("Got an unexpected error: ", err)
-	}
-	removeRoots(fsDirs)
-
-	fsDirs, err = getRandomDisks(nDisks)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	endpoints, err = parseStorageEndpoints(fsDirs)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// One disk is not found, heal corrupted disks should return nil
-	obj, _, err = initObjectLayer(endpoints)
-	if err != nil {
-		t.Fatal(err)
-	}
-	xl = obj.(*xlObjects)
-	for i := 0; i <= 2; i++ {
-		if err = xl.storageDisks[i].DeleteFile(".minio.sys", "format.json"); err != nil {
-			t.Fatal(err)
-		}
-	}
-	posixDisk, ok := xl.storageDisks[3].(*retryStorage)
-	if !ok {
-		t.Fatal("storage disk is not *retryStorage type")
-	}
-	xl.storageDisks[3] = newNaughtyDisk(posixDisk, nil, errDiskNotFound)
-	expectedErr := fmt.Errorf("Unable to initialize format %s and %s", errSomeDiskOffline, errSomeDiskUnformatted)
-	if err = healFormatXL(xl.storageDisks); err != nil {
-		if err.Error() != expectedErr.Error() {
-			t.Fatal("Got an unexpected error: ", err)
-		}
-	}
-	removeRoots(fsDirs)
-
-	fsDirs, err = getRandomDisks(nDisks)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	endpoints, err = parseStorageEndpoints(fsDirs)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// One disk is not found, heal corrupted disks should return nil
-	obj, _, err = initObjectLayer(endpoints)
-	if err != nil {
-		t.Fatal(err)
-	}
-	xl = obj.(*xlObjects)
-	if err = obj.MakeBucket(getRandomBucketName()); err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i <= 2; i++ {
-		if err = xl.storageDisks[i].DeleteFile(".minio.sys", "format.json"); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err = healFormatXL(xl.storageDisks); err != nil {
-		t.Fatal("Got an unexpected error: ", err)
-	}
-	removeRoots(fsDirs)
-}
-
 // Tests undoes and validates if the undoing completes successfully.
 func TestUndoMakeBucket(t *testing.T) {
-	root, err := newTestConfig("us-east-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer removeAll(root)
-
 	nDisks := 16
 	fsDirs, err := getRandomDisks(nDisks)
 	if err != nil {
@@ -284,28 +32,22 @@ func TestUndoMakeBucket(t *testing.T) {
 	}
 	defer removeRoots(fsDirs)
 
-	endpoints, err := parseStorageEndpoints(fsDirs)
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	// Remove format.json on 16 disks.
-	obj, _, err := initObjectLayer(endpoints)
+	obj, _, err := initObjectLayer(mustGetNewEndpointList(fsDirs...))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	bucketName := getRandomBucketName()
-	if err = obj.MakeBucket(bucketName); err != nil {
+	if err = obj.MakeBucketWithLocation(context.Background(), bucketName, ""); err != nil {
 		t.Fatal(err)
 	}
 	xl := obj.(*xlObjects)
 	undoMakeBucket(xl.storageDisks, bucketName)
 
 	// Validate if bucket was deleted properly.
-	_, err = obj.GetBucketInfo(bucketName)
+	_, err = obj.GetBucketInfo(context.Background(), bucketName)
 	if err != nil {
-		err = errorCause(err)
 		switch err.(type) {
 		case BucketNotFound:
 		default:
@@ -314,112 +56,83 @@ func TestUndoMakeBucket(t *testing.T) {
 	}
 }
 
-// Tests quick healing of bucket and bucket metadata.
-func TestQuickHeal(t *testing.T) {
-	root, err := newTestConfig("us-east-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer removeAll(root)
-
+// Tests healing of object.
+func TestHealObjectXL(t *testing.T) {
 	nDisks := 16
 	fsDirs, err := getRandomDisks(nDisks)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer removeRoots(fsDirs)
 
-	endpoints, err := parseStorageEndpoints(fsDirs)
+	// Everything is fine, should return nil
+	obj, _, err := initObjectLayer(mustGetNewEndpointList(fsDirs...))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Remove format.json on 16 disks.
-	obj, _, err := initObjectLayer(endpoints)
+	bucket := "bucket"
+	object := "object"
+	data := bytes.Repeat([]byte("a"), 5*1024*1024)
+	var opts ObjectOptions
+
+	err = obj.MakeBucketWithLocation(context.Background(), bucket, "")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Failed to make a bucket - %v", err)
 	}
 
-	bucketName := getRandomBucketName()
-	if err = obj.MakeBucket(bucketName); err != nil {
-		t.Fatal(err)
+	// Create an object with multiple parts uploaded in decreasing
+	// part number.
+	uploadID, err := obj.NewMultipartUpload(context.Background(), bucket, object, nil, opts)
+	if err != nil {
+		t.Fatalf("Failed to create a multipart upload - %v", err)
 	}
 
+	var uploadedParts []CompletePart
+	for _, partID := range []int{2, 1} {
+		pInfo, err1 := obj.PutObjectPart(context.Background(), bucket, object, uploadID, partID, mustGetPutObjReader(t, bytes.NewReader(data), int64(len(data)), "", ""), opts)
+		if err1 != nil {
+			t.Fatalf("Failed to upload a part - %v", err1)
+		}
+		uploadedParts = append(uploadedParts, CompletePart{
+			PartNumber: pInfo.PartNumber,
+			ETag:       pInfo.ETag,
+		})
+	}
+
+	_, err = obj.CompleteMultipartUpload(context.Background(), bucket, object, uploadID, uploadedParts, ObjectOptions{})
+	if err != nil {
+		t.Fatalf("Failed to complete multipart upload - %v", err)
+	}
+
+	// Remove the object backend files from the first disk.
 	xl := obj.(*xlObjects)
-	for i := 0; i <= 2; i++ {
-		if err = xl.storageDisks[i].DeleteVol(bucketName); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	// Heal the missing buckets.
-	if err = quickHeal(xl.storageDisks, xl.writeQuorum, xl.readQuorum); err != nil {
-		t.Fatal(err)
-	}
-
-	// Validate if buckets were indeed healed.
-	for i := 0; i <= 2; i++ {
-		if _, err = xl.storageDisks[i].StatVol(bucketName); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	// Corrupt one of the disks to return unformatted disk.
-	posixDisk, ok := xl.storageDisks[0].(*retryStorage)
-	if !ok {
-		t.Fatal("storage disk is not *retryStorage type")
-	}
-	xl.storageDisks[0] = newNaughtyDisk(posixDisk, nil, errUnformattedDisk)
-	if err = quickHeal(xl.storageDisks, xl.writeQuorum, xl.readQuorum); err != errUnformattedDisk {
-		t.Fatal(err)
-	}
-
-	fsDirs, err = getRandomDisks(nDisks)
+	firstDisk := xl.storageDisks[0]
+	err = firstDisk.DeleteFile(bucket, filepath.Join(object, xlMetaJSONFile))
 	if err != nil {
-		t.Fatal(err)
-	}
-	defer removeRoots(fsDirs)
-
-	endpoints, err = parseStorageEndpoints(fsDirs)
-	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Failed to delete a file - %v", err)
 	}
 
-	// One disk is not found, heal corrupted disks should return nil
-	obj, _, err = initObjectLayer(endpoints)
+	_, err = obj.HealObject(context.Background(), bucket, object, false)
 	if err != nil {
-		t.Fatal(err)
-	}
-	xl = obj.(*xlObjects)
-	xl.storageDisks[0] = nil
-	if err = quickHeal(xl.storageDisks, xl.writeQuorum, xl.readQuorum); err != nil {
-		t.Fatal("Got an unexpected error: ", err)
+		t.Fatalf("Failed to heal object - %v", err)
 	}
 
-	fsDirs, err = getRandomDisks(nDisks)
+	_, err = firstDisk.StatFile(bucket, filepath.Join(object, xlMetaJSONFile))
 	if err != nil {
-		t.Fatal(err)
-	}
-	defer removeRoots(fsDirs)
-
-	endpoints, err = parseStorageEndpoints(fsDirs)
-	if err != nil {
-		t.Fatal(err)
+		t.Errorf("Expected xl.json file to be present but stat failed - %v", err)
 	}
 
-	// One disk is not found, heal corrupted disks should return nil
-	obj, _, err = initObjectLayer(endpoints)
-	if err != nil {
-		t.Fatal(err)
+	// Nil more than half the disks, to remove write quorum.
+	for i := 0; i <= len(xl.storageDisks)/2; i++ {
+		xl.storageDisks[i] = nil
 	}
-	xl = obj.(*xlObjects)
-	// Corrupt one of the disks to return unformatted disk.
-	posixDisk, ok = xl.storageDisks[0].(*retryStorage)
-	if !ok {
-		t.Fatal("storage disk is not *retryStorage type")
-	}
-	xl.storageDisks[0] = newNaughtyDisk(posixDisk, nil, errDiskNotFound)
-	if err = quickHeal(xl.storageDisks, xl.writeQuorum, xl.readQuorum); err != nil {
-		t.Fatal("Got an unexpected error: ", err)
+
+	// Try healing now, expect to receive errDiskNotFound.
+	_, err = obj.HealObject(context.Background(), bucket, object, false)
+	// since majority of xl.jsons are not available, object quorum can't be read properly and error will be errXLReadQuorum
+	if _, ok := err.(InsufficientReadQuorum); !ok {
+		t.Errorf("Expected %v but received %v", InsufficientReadQuorum{}, err)
 	}
 }

@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016 Minio, Inc.
+ * Minio Cloud Storage, (C) 2016, 2017 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -48,17 +48,20 @@ func (r *lockedRandSource) Seed(seed int64) {
 // MaxJitter will randomize over the full exponential backoff time
 const MaxJitter = 1.0
 
-// NoJitter disables the use of jitter for randomizing the exponential backoff time
+// NoJitter disables the use of jitter for randomizing the
+// exponential backoff time
 const NoJitter = 0.0
 
 // Global random source for fetching random values.
 var globalRandomSource = rand.New(&lockedRandSource{
-	src: rand.NewSource(time.Now().UTC().UnixNano()),
+	src: rand.NewSource(UTCNow().UnixNano()),
 })
 
-// newRetryTimer creates a timer with exponentially increasing delays
-// until the maximum retry attempts are reached.
-func newRetryTimer(unit time.Duration, cap time.Duration, jitter float64, doneCh chan struct{}) <-chan int {
+// newRetryTimerJitter creates a timer with exponentially increasing delays
+// until the maximum retry attempts are reached. - this function is a fully
+// configurable version, meant for only advanced use cases. For the most part
+// one should use newRetryTimerSimple and newRetryTimer.
+func newRetryTimerWithJitter(unit time.Duration, cap time.Duration, jitter float64, doneCh chan struct{}) <-chan int {
 	attemptCh := make(chan int)
 
 	// normalize jitter to the range [0, 1.0]
@@ -90,18 +93,43 @@ func newRetryTimer(unit time.Duration, cap time.Duration, jitter float64, doneCh
 
 	go func() {
 		defer close(attemptCh)
-		var nextBackoff int
+		nextBackoff := 0
+		// Channel used to signal after the expiry of backoff wait seconds.
+		var timer *time.Timer
 		for {
-			select {
-			// Attempts starts.
+			select { // Attempts starts.
 			case attemptCh <- nextBackoff:
 				nextBackoff++
 			case <-doneCh:
 				// Stop the routine.
 				return
 			}
-			time.Sleep(exponentialBackoffWait(nextBackoff))
+			timer = time.NewTimer(exponentialBackoffWait(nextBackoff))
+			// wait till next backoff time or till doneCh gets a message.
+			select {
+			case <-timer.C:
+			case <-doneCh:
+				// stop the timer and return.
+				timer.Stop()
+				return
+			}
+
 		}
 	}()
+
+	// Start reading..
 	return attemptCh
+}
+
+// Default retry constants.
+const (
+	defaultRetryUnit = time.Second      // 1 second.
+	defaultRetryCap  = 30 * time.Second // 30 seconds.
+)
+
+// newRetryTimerSimple creates a timer with exponentially increasing delays
+// until the maximum retry attempts are reached. - this function is a
+// simpler version with all default values.
+func newRetryTimerSimple(doneCh chan struct{}) <-chan int {
+	return newRetryTimerWithJitter(defaultRetryUnit, defaultRetryCap, MaxJitter, doneCh)
 }

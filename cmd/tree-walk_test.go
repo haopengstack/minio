@@ -17,11 +17,12 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
+	"os"
 	"reflect"
 	"sort"
-	"strings"
 	"testing"
 	"time"
 )
@@ -127,26 +128,26 @@ func createNamespace(disk StorageAPI, volume string, files []string) error {
 
 // Test if tree walker returns entries matching prefix alone are received
 // when a non empty prefix is supplied.
-func testTreeWalkPrefix(t *testing.T, listDir listDirFunc, isLeaf isLeafFunc) {
+func testTreeWalkPrefix(t *testing.T, listDir listDirFunc, isLeaf isLeafFunc, isLeafDir isLeafDirFunc) {
 	// Start the tree walk go-routine.
 	prefix := "d/"
 	endWalkCh := make(chan struct{})
-	twResultCh := startTreeWalk(volume, prefix, "", true, listDir, isLeaf, endWalkCh)
+	twResultCh := startTreeWalk(context.Background(), volume, prefix, "", true, listDir, isLeaf, isLeafDir, endWalkCh)
 
 	// Check if all entries received on the channel match the prefix.
 	for res := range twResultCh {
-		if !strings.HasPrefix(res.entry, prefix) {
+		if !hasPrefix(res.entry, prefix) {
 			t.Errorf("Entry %s doesn't match prefix %s", res.entry, prefix)
 		}
 	}
 }
 
 // Test if entries received on tree walk's channel appear after the supplied marker.
-func testTreeWalkMarker(t *testing.T, listDir listDirFunc, isLeaf isLeafFunc) {
+func testTreeWalkMarker(t *testing.T, listDir listDirFunc, isLeaf isLeafFunc, isLeafDir isLeafDirFunc) {
 	// Start the tree walk go-routine.
 	prefix := ""
 	endWalkCh := make(chan struct{})
-	twResultCh := startTreeWalk(volume, prefix, "d/g", true, listDir, isLeaf, endWalkCh)
+	twResultCh := startTreeWalk(context.Background(), volume, prefix, "d/g", true, listDir, isLeaf, isLeafDir, endWalkCh)
 
 	// Check if only 3 entries, namely d/g/h, i/j/k, lmn are received on the channel.
 	expectedCount := 3
@@ -165,10 +166,7 @@ func TestTreeWalk(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unable to create tmp directory: %s", err)
 	}
-	endpoints, err := parseStorageEndpoints([]string{fsDir})
-	if err != nil {
-		t.Fatalf("Unexpected error %s", err)
-	}
+	endpoints := mustGetNewEndpointList(fsDir)
 	disk, err := newStorageAPI(endpoints[0])
 	if err != nil {
 		t.Fatalf("Unable to create StorageAPI: %s", err)
@@ -187,14 +185,23 @@ func TestTreeWalk(t *testing.T) {
 	}
 
 	isLeaf := func(volume, prefix string) bool {
-		return !strings.HasSuffix(prefix, slashSeparator)
+		return !hasSuffix(prefix, slashSeparator)
 	}
-	listDir := listDirFactory(isLeaf, xlTreeWalkIgnoredErrs, disk)
+
+	isLeafDir := func(volume, prefix string) bool {
+		entries, listErr := disk.ListDir(volume, prefix, 1)
+		if listErr != nil {
+			return false
+		}
+		return len(entries) == 0
+	}
+
+	listDir := listDirFactory(context.Background(), isLeaf, disk)
 	// Simple test for prefix based walk.
-	testTreeWalkPrefix(t, listDir, isLeaf)
+	testTreeWalkPrefix(t, listDir, isLeaf, isLeafDir)
 	// Simple test when marker is set.
-	testTreeWalkMarker(t, listDir, isLeaf)
-	err = removeAll(fsDir)
+	testTreeWalkMarker(t, listDir, isLeaf, isLeafDir)
+	err = os.RemoveAll(fsDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,10 +213,7 @@ func TestTreeWalkTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unable to create tmp directory: %s", err)
 	}
-	endpoints, err := parseStorageEndpoints([]string{fsDir})
-	if err != nil {
-		t.Fatalf("Unexpected error %s", err)
-	}
+	endpoints := mustGetNewEndpointList(fsDir)
 	disk, err := newStorageAPI(endpoints[0])
 	if err != nil {
 		t.Fatalf("Unable to create StorageAPI: %s", err)
@@ -225,9 +229,18 @@ func TestTreeWalkTimeout(t *testing.T) {
 	}
 
 	isLeaf := func(volume, prefix string) bool {
-		return !strings.HasSuffix(prefix, slashSeparator)
+		return !hasSuffix(prefix, slashSeparator)
 	}
-	listDir := listDirFactory(isLeaf, xlTreeWalkIgnoredErrs, disk)
+
+	isLeafDir := func(volume, prefix string) bool {
+		entries, listErr := disk.ListDir(volume, prefix, 1)
+		if listErr != nil {
+			return false
+		}
+		return len(entries) == 0
+	}
+
+	listDir := listDirFactory(context.Background(), isLeaf, disk)
 
 	// TreeWalk pool with 2 seconds timeout for tree-walk go routines.
 	pool := newTreeWalkPool(2 * time.Second)
@@ -236,7 +249,7 @@ func TestTreeWalkTimeout(t *testing.T) {
 	prefix := ""
 	marker := ""
 	recursive := true
-	resultCh := startTreeWalk(volume, prefix, marker, recursive, listDir, isLeaf, endWalkCh)
+	resultCh := startTreeWalk(context.Background(), volume, prefix, marker, recursive, listDir, isLeaf, isLeafDir, endWalkCh)
 
 	params := listParams{
 		bucket:    volume,
@@ -265,7 +278,7 @@ func TestTreeWalkTimeout(t *testing.T) {
 	if ok {
 		t.Error("Tree-walk go routine has not exited after timeout.")
 	}
-	err = removeAll(fsDir)
+	err = os.RemoveAll(fsDir)
 	if err != nil {
 		t.Error(err)
 	}
@@ -286,26 +299,23 @@ func TestListDir(t *testing.T) {
 		t.Errorf("Unable to create tmp directory: %s", err)
 	}
 
-	endpoints, err := parseStorageEndpoints([]string{fsDir1, fsDir2})
-	if err != nil {
-		t.Fatalf("Unexpected error %s", err)
-	}
-
 	// Create two StorageAPIs disk1 and disk2.
+	endpoints := mustGetNewEndpointList(fsDir1)
 	disk1, err := newStorageAPI(endpoints[0])
 	if err != nil {
 		t.Errorf("Unable to create StorageAPI: %s", err)
 	}
 
-	disk2, err := newStorageAPI(endpoints[1])
+	endpoints = mustGetNewEndpointList(fsDir2)
+	disk2, err := newStorageAPI(endpoints[0])
 	if err != nil {
 		t.Errorf("Unable to create StorageAPI: %s", err)
 	}
 
 	// create listDir function.
-	listDir := listDirFactory(func(volume, prefix string) bool {
-		return !strings.HasSuffix(prefix, slashSeparator)
-	}, xlTreeWalkIgnoredErrs, disk1, disk2)
+	listDir := listDirFactory(context.Background(), func(volume, prefix string) bool {
+		return !hasSuffix(prefix, slashSeparator)
+	}, disk1, disk2)
 
 	// Create file1 in fsDir1 and file2 in fsDir2.
 	disks := []StorageAPI{disk1, disk2}
@@ -317,42 +327,34 @@ func TestListDir(t *testing.T) {
 	}
 
 	// Should list "file1" from fsDir1.
-	entries, _, err := listDir(volume, "", "")
-	if err != nil {
-		t.Error(err)
-	}
-	if len(entries) != 1 {
-		t.Fatal("Expected the number of entries to be 1")
+	entries, _ := listDir(volume, "", "")
+	if len(entries) != 2 {
+		t.Fatal("Expected the number of entries to be 2")
 	}
 	if entries[0] != file1 {
 		t.Fatal("Expected the entry to be file1")
 	}
+	if entries[1] != file2 {
+		t.Fatal("Expected the entry to be file2")
+	}
 
-	// Remove fsDir1 to test failover.
-	err = removeAll(fsDir1)
+	// Remove fsDir1, list should return entries from fsDir2
+	err = os.RemoveAll(fsDir1)
 	if err != nil {
 		t.Error(err)
 	}
 
 	// Should list "file2" from fsDir2.
-	entries, _, err = listDir(volume, "", "")
-	if err != nil {
-		t.Error(err)
-	}
+	entries, _ = listDir(volume, "", "")
 	if len(entries) != 1 {
 		t.Fatal("Expected the number of entries to be 1")
 	}
 	if entries[0] != file2 {
 		t.Fatal("Expected the entry to be file2")
 	}
-	err = removeAll(fsDir2)
+	err = os.RemoveAll(fsDir2)
 	if err != nil {
 		t.Error(err)
-	}
-	// None of the disks are available, should get errDiskNotFound.
-	_, _, err = listDir(volume, "", "")
-	if errorCause(err) != errDiskNotFound {
-		t.Error("expected errDiskNotFound error.")
 	}
 }
 
@@ -365,10 +367,7 @@ func TestRecursiveTreeWalk(t *testing.T) {
 		t.Fatalf("Unable to create tmp directory: %s", err)
 	}
 
-	endpoints, err := parseStorageEndpoints([]string{fsDir1})
-	if err != nil {
-		t.Fatalf("Unexpected error %s", err)
-	}
+	endpoints := mustGetNewEndpointList(fsDir1)
 	disk1, err := newStorageAPI(endpoints[0])
 	if err != nil {
 		t.Fatalf("Unable to create StorageAPI: %s", err)
@@ -376,11 +375,19 @@ func TestRecursiveTreeWalk(t *testing.T) {
 
 	// Simple isLeaf check, returns true if there is no trailing "/"
 	isLeaf := func(volume, prefix string) bool {
-		return !strings.HasSuffix(prefix, slashSeparator)
+		return !hasSuffix(prefix, slashSeparator)
+	}
+
+	isLeafDir := func(volume, prefix string) bool {
+		entries, listErr := disk1.ListDir(volume, prefix, 1)
+		if listErr != nil {
+			return false
+		}
+		return len(entries) == 0
 	}
 
 	// Create listDir function.
-	listDir := listDirFactory(isLeaf, xlTreeWalkIgnoredErrs, disk1)
+	listDir := listDirFactory(context.Background(), isLeaf, disk1)
 
 	// Create the namespace.
 	var files = []string{
@@ -454,15 +461,15 @@ func TestRecursiveTreeWalk(t *testing.T) {
 		}},
 	}
 	for i, testCase := range testCases {
-		for entry := range startTreeWalk(volume,
+		for entry := range startTreeWalk(context.Background(), volume,
 			testCase.prefix, testCase.marker, testCase.recursive,
-			listDir, isLeaf, endWalkCh) {
+			listDir, isLeaf, isLeafDir, endWalkCh) {
 			if _, found := testCase.expected[entry.entry]; !found {
 				t.Errorf("Test %d: Expected %s, but couldn't find", i+1, entry.entry)
 			}
 		}
 	}
-	err = removeAll(fsDir1)
+	err = os.RemoveAll(fsDir1)
 	if err != nil {
 		t.Error(err)
 	}
@@ -475,10 +482,7 @@ func TestSortedness(t *testing.T) {
 		t.Errorf("Unable to create tmp directory: %s", err)
 	}
 
-	endpoints, err := parseStorageEndpoints([]string{fsDir1})
-	if err != nil {
-		t.Fatalf("Unexpected error %s", err)
-	}
+	endpoints := mustGetNewEndpointList(fsDir1)
 	disk1, err := newStorageAPI(endpoints[0])
 	if err != nil {
 		t.Fatalf("Unable to create StorageAPI: %s", err)
@@ -486,10 +490,19 @@ func TestSortedness(t *testing.T) {
 
 	// Simple isLeaf check, returns true if there is no trailing "/"
 	isLeaf := func(volume, prefix string) bool {
-		return !strings.HasSuffix(prefix, slashSeparator)
+		return !hasSuffix(prefix, slashSeparator)
 	}
+
+	isLeafDir := func(volume, prefix string) bool {
+		entries, listErr := disk1.ListDir(volume, prefix, 1)
+		if listErr != nil {
+			return false
+		}
+		return len(entries) == 0
+	}
+
 	// Create listDir function.
-	listDir := listDirFactory(isLeaf, xlTreeWalkIgnoredErrs, disk1)
+	listDir := listDirFactory(context.Background(), isLeaf, disk1)
 
 	// Create the namespace.
 	var files = []string{
@@ -529,9 +542,9 @@ func TestSortedness(t *testing.T) {
 	}
 	for i, test := range testCases {
 		var actualEntries []string
-		for entry := range startTreeWalk(volume,
+		for entry := range startTreeWalk(context.Background(), volume,
 			test.prefix, test.marker, test.recursive,
-			listDir, isLeaf, endWalkCh) {
+			listDir, isLeaf, isLeafDir, endWalkCh) {
 			actualEntries = append(actualEntries, entry.entry)
 		}
 		if !sort.IsSorted(sort.StringSlice(actualEntries)) {
@@ -540,7 +553,7 @@ func TestSortedness(t *testing.T) {
 	}
 
 	// Remove directory created for testing
-	err = removeAll(fsDir1)
+	err = os.RemoveAll(fsDir1)
 	if err != nil {
 		t.Error(err)
 	}
@@ -553,20 +566,26 @@ func TestTreeWalkIsEnd(t *testing.T) {
 		t.Errorf("Unable to create tmp directory: %s", err)
 	}
 
-	endpoints, err := parseStorageEndpoints([]string{fsDir1})
-	if err != nil {
-		t.Fatalf("Unexpected error %s", err)
-	}
+	endpoints := mustGetNewEndpointList(fsDir1)
 	disk1, err := newStorageAPI(endpoints[0])
 	if err != nil {
 		t.Fatalf("Unable to create StorageAPI: %s", err)
 	}
 
 	isLeaf := func(volume, prefix string) bool {
-		return !strings.HasSuffix(prefix, slashSeparator)
+		return !hasSuffix(prefix, slashSeparator)
 	}
+
+	isLeafDir := func(volume, prefix string) bool {
+		entries, listErr := disk1.ListDir(volume, prefix, 1)
+		if listErr != nil {
+			return false
+		}
+		return len(entries) == 0
+	}
+
 	// Create listDir function.
-	listDir := listDirFactory(isLeaf, xlTreeWalkIgnoredErrs, disk1)
+	listDir := listDirFactory(context.Background(), isLeaf, disk1)
 
 	// Create the namespace.
 	var files = []string{
@@ -607,7 +626,7 @@ func TestTreeWalkIsEnd(t *testing.T) {
 	}
 	for i, test := range testCases {
 		var entry treeWalkResult
-		for entry = range startTreeWalk(volume, test.prefix, test.marker, test.recursive, listDir, isLeaf, endWalkCh) {
+		for entry = range startTreeWalk(context.Background(), volume, test.prefix, test.marker, test.recursive, listDir, isLeaf, isLeafDir, endWalkCh) {
 		}
 		if entry.entry != test.expectedEntry {
 			t.Errorf("Test %d: Expected entry %s, but received %s with the EOF marker", i, test.expectedEntry, entry.entry)
@@ -618,7 +637,7 @@ func TestTreeWalkIsEnd(t *testing.T) {
 	}
 
 	// Remove directory created for testing
-	err = removeAll(fsDir1)
+	err = os.RemoveAll(fsDir1)
 	if err != nil {
 		t.Error(err)
 	}

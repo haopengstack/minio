@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016 Minio, Inc.
+ * Minio Cloud Storage, (C) 2016, 2017, 2018 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,10 +17,25 @@
 package cmd
 
 import (
+	"context"
+	"net"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/minio/minio/pkg/event"
+	"github.com/minio/minio/pkg/handlers"
 )
+
+// Validates the preconditions for CopyObjectPart, returns true if CopyObjectPart
+// operation should not proceed. Preconditions supported are:
+//  x-amz-copy-source-if-modified-since
+//  x-amz-copy-source-if-unmodified-since
+//  x-amz-copy-source-if-match
+//  x-amz-copy-source-if-none-match
+func checkCopyObjectPartPreconditions(w http.ResponseWriter, r *http.Request, objInfo ObjectInfo) bool {
+	return checkCopyObjectPreconditions(w, r, objInfo)
+}
 
 // Validates the preconditions for CopyObject, returns true if CopyObject operation should not proceed.
 // Preconditions supported are:
@@ -48,19 +63,21 @@ func checkCopyObjectPreconditions(w http.ResponseWriter, r *http.Request, objInf
 		// set object-related metadata headers
 		w.Header().Set("Last-Modified", objInfo.ModTime.UTC().Format(http.TimeFormat))
 
-		if objInfo.MD5Sum != "" {
-			w.Header().Set("ETag", "\""+objInfo.MD5Sum+"\"")
+		if objInfo.ETag != "" {
+			w.Header().Set("ETag", "\""+objInfo.ETag+"\"")
 		}
 	}
 	// x-amz-copy-source-if-modified-since: Return the object only if it has been modified
 	// since the specified time otherwise return 412 (precondition failed).
 	ifModifiedSinceHeader := r.Header.Get("x-amz-copy-source-if-modified-since")
 	if ifModifiedSinceHeader != "" {
-		if !ifModifiedSince(objInfo.ModTime, ifModifiedSinceHeader) {
-			// If the object is not modified since the specified time.
-			writeHeaders()
-			writeErrorResponse(w, r, ErrPreconditionFailed, r.URL.Path)
-			return true
+		if givenTime, err := time.Parse(http.TimeFormat, ifModifiedSinceHeader); err == nil {
+			if !ifModifiedSince(objInfo.ModTime, givenTime) {
+				// If the object is not modified since the specified time.
+				writeHeaders()
+				writeErrorResponse(w, ErrPreconditionFailed, r.URL, guessIsBrowserReq(r))
+				return true
+			}
 		}
 	}
 
@@ -68,11 +85,13 @@ func checkCopyObjectPreconditions(w http.ResponseWriter, r *http.Request, objInf
 	// modified since the specified time, otherwise return a 412 (precondition failed).
 	ifUnmodifiedSinceHeader := r.Header.Get("x-amz-copy-source-if-unmodified-since")
 	if ifUnmodifiedSinceHeader != "" {
-		if ifModifiedSince(objInfo.ModTime, ifUnmodifiedSinceHeader) {
-			// If the object is modified since the specified time.
-			writeHeaders()
-			writeErrorResponse(w, r, ErrPreconditionFailed, r.URL.Path)
-			return true
+		if givenTime, err := time.Parse(http.TimeFormat, ifUnmodifiedSinceHeader); err == nil {
+			if ifModifiedSince(objInfo.ModTime, givenTime) {
+				// If the object is modified since the specified time.
+				writeHeaders()
+				writeErrorResponse(w, ErrPreconditionFailed, r.URL, guessIsBrowserReq(r))
+				return true
+			}
 		}
 	}
 
@@ -80,10 +99,10 @@ func checkCopyObjectPreconditions(w http.ResponseWriter, r *http.Request, objInf
 	// same as the one specified; otherwise return a 412 (precondition failed).
 	ifMatchETagHeader := r.Header.Get("x-amz-copy-source-if-match")
 	if ifMatchETagHeader != "" {
-		if objInfo.MD5Sum != "" && !isETagEqual(objInfo.MD5Sum, ifMatchETagHeader) {
+		if objInfo.ETag != "" && !isETagEqual(objInfo.ETag, ifMatchETagHeader) {
 			// If the object ETag does not match with the specified ETag.
 			writeHeaders()
-			writeErrorResponse(w, r, ErrPreconditionFailed, r.URL.Path)
+			writeErrorResponse(w, ErrPreconditionFailed, r.URL, guessIsBrowserReq(r))
 			return true
 		}
 	}
@@ -92,10 +111,10 @@ func checkCopyObjectPreconditions(w http.ResponseWriter, r *http.Request, objInf
 	// one specified otherwise, return a 304 (not modified).
 	ifNoneMatchETagHeader := r.Header.Get("x-amz-copy-source-if-none-match")
 	if ifNoneMatchETagHeader != "" {
-		if objInfo.MD5Sum != "" && isETagEqual(objInfo.MD5Sum, ifNoneMatchETagHeader) {
+		if objInfo.ETag != "" && isETagEqual(objInfo.ETag, ifNoneMatchETagHeader) {
 			// If the object ETag matches with the specified ETag.
 			writeHeaders()
-			writeErrorResponse(w, r, ErrPreconditionFailed, r.URL.Path)
+			writeErrorResponse(w, ErrPreconditionFailed, r.URL, guessIsBrowserReq(r))
 			return true
 		}
 	}
@@ -129,19 +148,21 @@ func checkPreconditions(w http.ResponseWriter, r *http.Request, objInfo ObjectIn
 		// set object-related metadata headers
 		w.Header().Set("Last-Modified", objInfo.ModTime.UTC().Format(http.TimeFormat))
 
-		if objInfo.MD5Sum != "" {
-			w.Header().Set("ETag", "\""+objInfo.MD5Sum+"\"")
+		if objInfo.ETag != "" {
+			w.Header().Set("ETag", "\""+objInfo.ETag+"\"")
 		}
 	}
 	// If-Modified-Since : Return the object only if it has been modified since the specified time,
 	// otherwise return a 304 (not modified).
 	ifModifiedSinceHeader := r.Header.Get("If-Modified-Since")
 	if ifModifiedSinceHeader != "" {
-		if !ifModifiedSince(objInfo.ModTime, ifModifiedSinceHeader) {
-			// If the object is not modified since the specified time.
-			writeHeaders()
-			w.WriteHeader(http.StatusNotModified)
-			return true
+		if givenTime, err := time.Parse(http.TimeFormat, ifModifiedSinceHeader); err == nil {
+			if !ifModifiedSince(objInfo.ModTime, givenTime) {
+				// If the object is not modified since the specified time.
+				writeHeaders()
+				w.WriteHeader(http.StatusNotModified)
+				return true
+			}
 		}
 	}
 
@@ -149,11 +170,13 @@ func checkPreconditions(w http.ResponseWriter, r *http.Request, objInfo ObjectIn
 	// time, otherwise return a 412 (precondition failed).
 	ifUnmodifiedSinceHeader := r.Header.Get("If-Unmodified-Since")
 	if ifUnmodifiedSinceHeader != "" {
-		if ifModifiedSince(objInfo.ModTime, ifUnmodifiedSinceHeader) {
-			// If the object is modified since the specified time.
-			writeHeaders()
-			writeErrorResponse(w, r, ErrPreconditionFailed, r.URL.Path)
-			return true
+		if givenTime, err := time.Parse(http.TimeFormat, ifUnmodifiedSinceHeader); err == nil {
+			if ifModifiedSince(objInfo.ModTime, givenTime) {
+				// If the object is modified since the specified time.
+				writeHeaders()
+				writeErrorResponse(w, ErrPreconditionFailed, r.URL, guessIsBrowserReq(r))
+				return true
+			}
 		}
 	}
 
@@ -161,10 +184,10 @@ func checkPreconditions(w http.ResponseWriter, r *http.Request, objInfo ObjectIn
 	// otherwise return a 412 (precondition failed).
 	ifMatchETagHeader := r.Header.Get("If-Match")
 	if ifMatchETagHeader != "" {
-		if !isETagEqual(objInfo.MD5Sum, ifMatchETagHeader) {
+		if !isETagEqual(objInfo.ETag, ifMatchETagHeader) {
 			// If the object ETag does not match with the specified ETag.
 			writeHeaders()
-			writeErrorResponse(w, r, ErrPreconditionFailed, r.URL.Path)
+			writeErrorResponse(w, ErrPreconditionFailed, r.URL, guessIsBrowserReq(r))
 			return true
 		}
 	}
@@ -173,7 +196,7 @@ func checkPreconditions(w http.ResponseWriter, r *http.Request, objInfo ObjectIn
 	// one specified otherwise, return a 304 (not modified).
 	ifNoneMatchETagHeader := r.Header.Get("If-None-Match")
 	if ifNoneMatchETagHeader != "" {
-		if isETagEqual(objInfo.MD5Sum, ifNoneMatchETagHeader) {
+		if isETagEqual(objInfo.ETag, ifNoneMatchETagHeader) {
 			// If the object ETag matches with the specified ETag.
 			writeHeaders()
 			w.WriteHeader(http.StatusNotModified)
@@ -185,11 +208,7 @@ func checkPreconditions(w http.ResponseWriter, r *http.Request, objInfo ObjectIn
 }
 
 // returns true if object was modified after givenTime.
-func ifModifiedSince(objTime time.Time, givenTimeStr string) bool {
-	givenTime, err := time.Parse(http.TimeFormat, givenTimeStr)
-	if err != nil {
-		return true
-	}
+func ifModifiedSince(objTime time.Time, givenTime time.Time) bool {
 	// The Date-Modified header truncates sub-second precision, so
 	// use mtime < t+1s instead of mtime <= t to check for unmodified.
 	if objTime.After(givenTime.Add(1 * time.Second)) {
@@ -209,4 +228,36 @@ func canonicalizeETag(etag string) string {
 // are equal, false otherwise
 func isETagEqual(left, right string) bool {
 	return canonicalizeETag(left) == canonicalizeETag(right)
+}
+
+// deleteObject is a convenient wrapper to delete an object, this
+// is a common function to be called from object handlers and
+// web handlers.
+func deleteObject(ctx context.Context, obj ObjectLayer, cache CacheObjectLayer, bucket, object string, r *http.Request) (err error) {
+	deleteObject := obj.DeleteObject
+	if cache != nil {
+		deleteObject = cache.DeleteObject
+	}
+	// Proceed to delete the object.
+	if err = deleteObject(ctx, bucket, object); err != nil {
+		return err
+	}
+
+	// Get host and port from Request.RemoteAddr.
+	host, port, _ := net.SplitHostPort(handlers.GetSourceIP(r))
+
+	// Notify object deleted event.
+	sendEvent(eventArgs{
+		EventName:  event.ObjectRemovedDelete,
+		BucketName: bucket,
+		Object: ObjectInfo{
+			Name: object,
+		},
+		ReqParams: extractReqParams(r),
+		UserAgent: r.UserAgent(),
+		Host:      host,
+		Port:      port,
+	})
+
+	return nil
 }

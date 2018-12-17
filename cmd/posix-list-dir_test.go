@@ -69,26 +69,6 @@ func setupTestReadDirEmpty(t *testing.T) (testResults []result) {
 	return testResults
 }
 
-// Test to read empty directory with only reserved names.
-func setupTestReadDirReserved(t *testing.T) (testResults []result) {
-	dir := mustSetupDir(t)
-	entries := []string{}
-	// Create a file with reserved name.
-	for _, reservedName := range posixReservedPrefix {
-		if err := ioutil.WriteFile(filepath.Join(dir, reservedName), []byte{}, os.ModePerm); err != nil {
-			// For cleanup, its required to add these entries into test results.
-			testResults = append(testResults, result{dir, entries})
-			t.Fatalf("Unable to create file, %s", err)
-		}
-		// entries = append(entries, reservedName) - reserved files are skipped.
-	}
-	sort.Strings(entries)
-
-	// Add entries slice for this test directory.
-	testResults = append(testResults, result{dir, entries})
-	return testResults
-}
-
 // Test to read non-empty directory with only files.
 func setupTestReadDirFiles(t *testing.T) (testResults []result) {
 	dir := mustSetupDir(t)
@@ -198,8 +178,6 @@ func TestReadDir(t *testing.T) {
 
 	// Setup and capture test results for empty directory.
 	testResults = append(testResults, setupTestReadDirEmpty(t)...)
-	// Setup and capture test results for reserved files.
-	testResults = append(testResults, setupTestReadDirReserved(t)...)
 	// Setup and capture test results for directory with only files.
 	testResults = append(testResults, setupTestReadDirFiles(t)...)
 	// Setup and capture test results for directory with files and directories.
@@ -220,6 +198,44 @@ func TestReadDir(t *testing.T) {
 			if !checkResult(r.entries, entries) {
 				t.Fatalf("expected = %s, got: %s", r.entries, entries)
 			}
+		}
+	}
+}
+
+func TestReadDirN(t *testing.T) {
+	testCases := []struct {
+		numFiles    int
+		n           int
+		expectedNum int
+	}{
+		{0, 0, 0},
+		{0, 1, 0},
+		{1, 0, 1},
+		{0, -1, 0},
+		{1, -1, 1},
+		{10, -1, 10},
+		{1, 1, 1},
+		{2, 1, 1},
+		{10, 9, 9},
+		{10, 10, 10},
+		{10, 11, 10},
+	}
+
+	for i, testCase := range testCases {
+		dir := mustSetupDir(t)
+		defer os.RemoveAll(dir)
+
+		for c := 1; c <= testCase.numFiles; c++ {
+			if err := ioutil.WriteFile(filepath.Join(dir, fmt.Sprintf("%d", c)), []byte{}, os.ModePerm); err != nil {
+				t.Fatalf("Unable to create a file, %s", err)
+			}
+		}
+		entries, err := readDirN(dir, testCase.n)
+		if err != nil {
+			t.Fatalf("Unable to read entries, %s", err)
+		}
+		if len(entries) != testCase.expectedNum {
+			t.Fatalf("Test %d: unexpected number of entries, waiting for %d, but found %d", i+1, testCase.expectedNum, len(entries))
 		}
 	}
 }

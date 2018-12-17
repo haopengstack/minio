@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2014-2016 Minio, Inc.
+ * Minio Cloud Storage, (C) 2014, 2015, 2016, 2017, 2018 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,134 +17,198 @@
 package cmd
 
 import (
-	"net/rpc"
-	"net/url"
-	"path"
+	"context"
+	"crypto/tls"
+	"fmt"
+	"net"
+	"sort"
+	"strings"
 	"sync"
+	"time"
+
+	"github.com/minio/minio/cmd/logger"
+	xnet "github.com/minio/minio/pkg/net"
 )
 
-// localAdminClient - represents admin operation to be executed locally.
-type localAdminClient struct {
+var errUnsupportedSignal = fmt.Errorf("unsupported signal: only restart and stop signals are supported")
+
+// AdminRPCClient - admin RPC client talks to admin RPC server.
+type AdminRPCClient struct {
+	*RPCClient
 }
 
-// remoteAdminClient - represents admin operation to be executed
-// remotely, via RPC.
-type remoteAdminClient struct {
-	*AuthRPCClient
+// SignalService - calls SignalService RPC.
+func (rpcClient *AdminRPCClient) SignalService(signal serviceSignal) (err error) {
+	args := SignalServiceArgs{Sig: signal}
+	reply := VoidReply{}
+
+	return rpcClient.Call(adminServiceName+".SignalService", &args, &reply)
 }
 
-// stopRestarter - abstracts stop and restart operations for both
-// local and remote execution.
-type stopRestarter interface {
-	Stop() error
-	Restart() error
+// ReInitFormat - re-initialize disk format, remotely.
+func (rpcClient *AdminRPCClient) ReInitFormat(dryRun bool) error {
+	args := ReInitFormatArgs{DryRun: dryRun}
+	reply := VoidReply{}
+
+	return rpcClient.Call(adminServiceName+".ReInitFormat", &args, &reply)
 }
 
-// Stop - Sends a message over channel to the go-routine responsible
-// for stopping the process.
-func (lc localAdminClient) Stop() error {
-	globalServiceSignalCh <- serviceStop
-	return nil
+// ServerInfo - returns the server info of the server to which the RPC call is made.
+func (rpcClient *AdminRPCClient) ServerInfo() (sid ServerInfoData, err error) {
+	err = rpcClient.Call(adminServiceName+".ServerInfo", &AuthArgs{}, &sid)
+	return sid, err
 }
 
-// Restart - Sends a message over channel to the go-routine
-// responsible for restarting the process.
-func (lc localAdminClient) Restart() error {
-	globalServiceSignalCh <- serviceRestart
-	return nil
+// GetConfig - returns config.json of the remote server.
+func (rpcClient *AdminRPCClient) GetConfig() ([]byte, error) {
+	args := AuthArgs{}
+	var reply []byte
+
+	err := rpcClient.Call(adminServiceName+".GetConfig", &args, &reply)
+	return reply, err
 }
 
-// Stop - Sends stop command to remote server via RPC.
-func (rc remoteAdminClient) Stop() error {
-	args := GenericArgs{}
-	reply := GenericReply{}
-	err := rc.Call("Service.Shutdown", &args, &reply)
-	if err != nil && err == rpc.ErrShutdown {
-		rc.Close()
+// StartProfiling - starts profiling in the remote server.
+func (rpcClient *AdminRPCClient) StartProfiling(profiler string) error {
+	args := StartProfilingArgs{Profiler: profiler}
+	reply := VoidReply{}
+	return rpcClient.Call(adminServiceName+".StartProfiling", &args, &reply)
+}
+
+// DownloadProfilingData - returns profiling data of the remote server.
+func (rpcClient *AdminRPCClient) DownloadProfilingData() ([]byte, error) {
+	args := AuthArgs{}
+	var reply []byte
+
+	err := rpcClient.Call(adminServiceName+".DownloadProfilingData", &args, &reply)
+	return reply, err
+}
+
+// NewAdminRPCClient - returns new admin RPC client.
+func NewAdminRPCClient(host *xnet.Host) (*AdminRPCClient, error) {
+	scheme := "http"
+	if globalIsSSL {
+		scheme = "https"
 	}
-	return err
-}
 
-// Restart - Sends restart command to remote server via RPC.
-func (rc remoteAdminClient) Restart() error {
-	args := GenericArgs{}
-	reply := GenericReply{}
-	err := rc.Call("Service.Restart", &args, &reply)
-	if err != nil && err == rpc.ErrShutdown {
-		rc.Close()
+	serviceURL := &xnet.URL{
+		Scheme: scheme,
+		Host:   host.String(),
+		Path:   adminServicePath,
 	}
-	return err
+
+	var tlsConfig *tls.Config
+	if globalIsSSL {
+		tlsConfig = &tls.Config{
+			ServerName: host.Name,
+			RootCAs:    globalRootCAs,
+		}
+	}
+
+	rpcClient, err := NewRPCClient(
+		RPCClientArgs{
+			NewAuthTokenFunc: newAuthToken,
+			RPCVersion:       globalRPCAPIVersion,
+			ServiceName:      adminServiceName,
+			ServiceURL:       serviceURL,
+			TLSConfig:        tlsConfig,
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &AdminRPCClient{rpcClient}, nil
 }
 
-// adminPeer - represents an entity that implements Stop and Restart methods.
+// adminCmdRunner - abstracts local and remote execution of admin
+// commands like service stop and service restart.
+type adminCmdRunner interface {
+	SignalService(s serviceSignal) error
+	ReInitFormat(dryRun bool) error
+	ServerInfo() (ServerInfoData, error)
+	GetConfig() ([]byte, error)
+	StartProfiling(string) error
+	DownloadProfilingData() ([]byte, error)
+}
+
+// adminPeer - represents an entity that implements admin API RPCs.
 type adminPeer struct {
-	addr    string
-	svcClnt stopRestarter
+	addr      string
+	cmdRunner adminCmdRunner
+	isLocal   bool
 }
 
 // type alias for a collection of adminPeer.
 type adminPeers []adminPeer
 
 // makeAdminPeers - helper function to construct a collection of adminPeer.
-func makeAdminPeers(eps []*url.URL) adminPeers {
-	var servicePeers []adminPeer
-
-	// map to store peers that are already added to ret
-	seenAddr := make(map[string]bool)
-
-	// add local (self) as peer in the array
-	servicePeers = append(servicePeers, adminPeer{
-		globalMinioAddr,
-		localAdminClient{},
-	})
-	seenAddr[globalMinioAddr] = true
-
-	// iterate over endpoints to find new remote peers and add
-	// them to ret.
-	for _, ep := range eps {
-		if ep.Host == "" {
-			continue
-		}
-
-		// Check if the remote host has been added already
-		if !seenAddr[ep.Host] {
-			cfg := authConfig{
-				accessKey:   serverConfig.GetCredential().AccessKeyID,
-				secretKey:   serverConfig.GetCredential().SecretAccessKey,
-				address:     ep.Host,
-				secureConn:  isSSL(),
-				path:        path.Join(reservedBucket, servicePath),
-				loginMethod: "Service.LoginHandler",
-			}
-
-			servicePeers = append(servicePeers, adminPeer{
-				addr:    ep.Host,
-				svcClnt: &remoteAdminClient{newAuthClient(&cfg)},
-			})
-			seenAddr[ep.Host] = true
-		}
+func makeAdminPeers(endpoints EndpointList) (adminPeerList adminPeers) {
+	localAddr := GetLocalPeer(endpoints)
+	if strings.HasPrefix(localAddr, "127.0.0.1:") {
+		// Use first IPv4 instead of loopback address.
+		localAddr = net.JoinHostPort(sortIPs(localIP4.ToSlice())[0], globalMinioPort)
+	}
+	if strings.HasPrefix(localAddr, "[::1]:") {
+		// Use first IPv4 instead of loopback address.
+		localAddr = net.JoinHostPort(localIP6.ToSlice()[0], globalMinioPort)
 	}
 
-	return servicePeers
+	adminPeerList = append(adminPeerList, adminPeer{
+		addr:      localAddr,
+		cmdRunner: localAdminClient{},
+		isLocal:   true,
+	})
+
+	for _, hostStr := range GetRemotePeers(endpoints) {
+		host, err := xnet.ParseHost(hostStr)
+		logger.FatalIf(err, "Unable to parse Admin RPC Host")
+		rpcClient, err := NewAdminRPCClient(host)
+		logger.FatalIf(err, "Unable to initialize Admin RPC Client")
+		adminPeerList = append(adminPeerList, adminPeer{
+			addr:      hostStr,
+			cmdRunner: rpcClient,
+		})
+	}
+
+	return adminPeerList
+}
+
+// peersReInitFormat - reinitialize remote object layers to new format.
+func peersReInitFormat(peers adminPeers, dryRun bool) error {
+	errs := make([]error, len(peers))
+
+	// Send ReInitFormat RPC call to all nodes.
+	// for local adminPeer this is a no-op.
+	wg := sync.WaitGroup{}
+	for i, peer := range peers {
+		wg.Add(1)
+		go func(idx int, peer adminPeer) {
+			defer wg.Done()
+			if !peer.isLocal {
+				errs[idx] = peer.cmdRunner.ReInitFormat(dryRun)
+			}
+		}(i, peer)
+	}
+	wg.Wait()
+	return nil
 }
 
 // Initialize global adminPeer collection.
-func initGlobalAdminPeers(eps []*url.URL) {
-	globalAdminPeers = makeAdminPeers(eps)
+func initGlobalAdminPeers(endpoints EndpointList) {
+	globalAdminPeers = makeAdminPeers(endpoints)
 }
 
-// invokeServiceCmd - Invoke Stop/Restart command.
+// invokeServiceCmd - Invoke Restart/Stop command.
 func invokeServiceCmd(cp adminPeer, cmd serviceSignal) (err error) {
 	switch cmd {
-	case serviceStop:
-		err = cp.svcClnt.Stop()
-	case serviceRestart:
-		err = cp.svcClnt.Restart()
+	case serviceRestart, serviceStop:
+		err = cp.cmdRunner.SignalService(cmd)
 	}
 	return err
 }
 
-// sendServiceCmd - Invoke Stop/Restart command on remote peers
+// sendServiceCmd - Invoke Restart command on remote peers
 // adminPeer followed by on the local peer.
 func sendServiceCmd(cps adminPeers, cmd serviceSignal) {
 	// Send service command like stop or restart to all remote nodes and finally run on local node.
@@ -155,9 +219,82 @@ func sendServiceCmd(cps adminPeers, cmd serviceSignal) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			errs[idx] = invokeServiceCmd(remotePeers[idx], cmd)
+			// we use idx+1 because remotePeers slice is 1 position shifted w.r.t cps
+			errs[idx+1] = invokeServiceCmd(remotePeers[idx], cmd)
 		}(i)
 	}
 	wg.Wait()
 	errs[0] = invokeServiceCmd(cps[0], cmd)
+}
+
+// uptimeSlice - used to sort uptimes in chronological order.
+type uptimeSlice []struct {
+	err    error
+	uptime time.Duration
+}
+
+func (ts uptimeSlice) Len() int {
+	return len(ts)
+}
+
+func (ts uptimeSlice) Less(i, j int) bool {
+	return ts[i].uptime < ts[j].uptime
+}
+
+func (ts uptimeSlice) Swap(i, j int) {
+	ts[i], ts[j] = ts[j], ts[i]
+}
+
+// getPeerUptimes - returns the uptime since the last time read quorum
+// was established on success. Otherwise returns errXLReadQuorum.
+func getPeerUptimes(peers adminPeers) (time.Duration, error) {
+	// In a single node Erasure or FS backend setup the uptime of
+	// the setup is the uptime of the single minio server
+	// instance.
+	if !globalIsDistXL {
+		return UTCNow().Sub(globalBootTime), nil
+	}
+
+	uptimes := make(uptimeSlice, len(peers))
+
+	// Get up time of all servers.
+	wg := sync.WaitGroup{}
+	for i, peer := range peers {
+		wg.Add(1)
+		go func(idx int, peer adminPeer) {
+			defer wg.Done()
+			serverInfoData, rpcErr := peer.cmdRunner.ServerInfo()
+			uptimes[idx].uptime, uptimes[idx].err = serverInfoData.Properties.Uptime, rpcErr
+		}(i, peer)
+	}
+	wg.Wait()
+
+	// Sort uptimes in chronological order.
+	sort.Sort(uptimes)
+
+	// Pick the readQuorum'th uptime in chronological order. i.e,
+	// the time at which read quorum was (re-)established.
+	readQuorum := len(uptimes) / 2
+	validCount := 0
+	latestUptime := time.Duration(0)
+	for _, uptime := range uptimes {
+		if uptime.err != nil {
+			logger.LogIf(context.Background(), uptime.err)
+			continue
+		}
+
+		validCount++
+		if validCount >= readQuorum {
+			latestUptime = uptime.uptime
+			break
+		}
+	}
+
+	// Less than readQuorum "Admin.Uptime" RPC call returned
+	// successfully, so read-quorum unavailable.
+	if validCount < readQuorum {
+		return time.Duration(0), InsufficientReadQuorum{}
+	}
+
+	return latestUptime, nil
 }

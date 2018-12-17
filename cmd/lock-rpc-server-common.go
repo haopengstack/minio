@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016 Minio, Inc.
+ * Minio Cloud Storage, (C) 2016, 2017 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,19 +17,31 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"time"
+
+	"github.com/minio/minio/cmd/logger"
 )
 
+// nameLockRequesterInfoPair is a helper type for lock maintenance
+type nameLockRequesterInfoPair struct {
+	name string
+	lri  lockRequesterInfo
+}
+
 // Similar to removeEntry but only removes an entry only if the lock entry exists in map.
-func (l *lockServer) removeEntryIfExists(nlrip nameLockRequesterInfoPair) {
+func (l *localLocker) removeEntryIfExists(nlrip nameLockRequesterInfoPair) {
 	// Check if entry is still in map (could have been removed altogether by 'concurrent' (R)Unlock of last entry)
 	if lri, ok := l.lockMap[nlrip.name]; ok {
 		if !l.removeEntry(nlrip.name, nlrip.lri.uid, &lri) {
 			// Remove failed, in case it is a:
 			if nlrip.lri.writer {
 				// Writer: this should never happen as the whole (mapped) entry should have been deleted
-				errorIf(errors.New(""), "Lock maintenance failed to remove entry for write lock (should never happen)", nlrip.name, nlrip.lri.uid, lri)
+				reqInfo := (&logger.ReqInfo{}).AppendTags("name", nlrip.name)
+				reqInfo.AppendTags("uid", nlrip.lri.uid)
+				ctx := logger.SetReqInfo(context.Background(), reqInfo)
+				logger.LogIf(ctx, errors.New("Lock maintenance failed to remove entry for write lock (should never happen)"))
 			} // Reader: this can happen if multiple read locks were active and
 			// the one we are looking for has been released concurrently (so it is fine).
 		} // Removal went okay, all is fine.
@@ -38,7 +50,7 @@ func (l *lockServer) removeEntryIfExists(nlrip nameLockRequesterInfoPair) {
 
 // removeEntry either, based on the uid of the lock message, removes a single entry from the
 // lockRequesterInfo array or the whole array from the map (in case of a write lock or last read lock)
-func (l *lockServer) removeEntry(name, uid string, lri *[]lockRequesterInfo) bool {
+func (l *localLocker) removeEntry(name, uid string, lri *[]lockRequesterInfo) bool {
 	// Find correct entry to remove based on uid.
 	for index, entry := range *lri {
 		if entry.uid == uid {
@@ -57,20 +69,6 @@ func (l *lockServer) removeEntry(name, uid string, lri *[]lockRequesterInfo) boo
 	return false
 }
 
-// Validate lock args.
-// - validate time stamp.
-// - validate jwt token.
-func (l *lockServer) validateLockArgs(args *LockArgs) error {
-	curTime := time.Now().UTC()
-	if curTime.Sub(args.Timestamp) > globalMaxSkewTime || args.Timestamp.Sub(curTime) > globalMaxSkewTime {
-		return errServerTimeMismatch
-	}
-	if !isRPCTokenValid(args.Token) {
-		return errInvalidToken
-	}
-	return nil
-}
-
 // getLongLivedLocks returns locks that are older than a certain time and
 // have not been 'checked' for validity too soon enough
 func getLongLivedLocks(m map[string][]lockRequesterInfo, interval time.Duration) []nameLockRequesterInfoPair {
@@ -80,7 +78,7 @@ func getLongLivedLocks(m map[string][]lockRequesterInfo, interval time.Duration)
 			// Check whether enough time has gone by since last check
 			if time.Since(lriArray[idx].timeLastCheck) >= interval {
 				rslt = append(rslt, nameLockRequesterInfoPair{name: name, lri: lriArray[idx]})
-				lriArray[idx].timeLastCheck = time.Now().UTC()
+				lriArray[idx].timeLastCheck = UTCNow()
 			}
 		}
 	}

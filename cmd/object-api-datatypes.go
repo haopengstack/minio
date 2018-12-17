@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016 Minio, Inc.
+ * Minio Cloud Storage, (C) 2016, 2017 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,7 +16,13 @@
 
 package cmd
 
-import "time"
+import (
+	"io"
+	"time"
+
+	"github.com/minio/minio/pkg/hash"
+	"github.com/minio/minio/pkg/madmin"
+)
 
 // BackendType - represents different backend types.
 type BackendType int
@@ -25,28 +31,31 @@ type BackendType int
 const (
 	Unknown BackendType = iota
 	// Filesystem backend.
-	FS
-	// Multi disk single node XL backend.
-	XL
+	BackendFS
+	// Multi disk BackendErasure (single, distributed) backend.
+	BackendErasure
 	// Add your own backend.
 )
 
 // StorageInfo - represents total capacity of underlying storage.
 type StorageInfo struct {
-	// Total disk space.
-	Total int64
-	// Free available disk space.
-	Free int64
+	Used uint64 // Used total used per tenant.
+
 	// Backend type.
 	Backend struct {
-		// Represents various backend types, currently on FS and XL.
+		// Represents various backend types, currently on FS and Erasure.
 		Type BackendType
 
-		// Following fields are only meaningful if BackendType is XL.
-		OnlineDisks  int // Online disks during server startup.
-		OfflineDisks int // Offline disks during server startup.
-		ReadQuorum   int // Minimum disks required for successful read operations.
-		WriteQuorum  int // Minimum disks required for successful write operations.
+		// Following fields are only meaningful if BackendType is Erasure.
+		OnlineDisks      int // Online disks during server startup.
+		OfflineDisks     int // Offline disks during server startup.
+		StandardSCData   int // Data disks for currently configured Standard storage class.
+		StandardSCParity int // Parity disks for currently configured Standard storage class.
+		RRSCData         int // Data disks for currently configured Reduced Redundancy storage class.
+		RRSCParity       int // Parity disks for currently configured Reduced Redundancy storage class.
+
+		// List of all disk status, this is only meaningful if BackendType is Erasure.
+		Sets [][]madmin.DriveInfo
 	}
 }
 
@@ -76,8 +85,8 @@ type ObjectInfo struct {
 	// IsDir indicates if the object is prefix.
 	IsDir bool
 
-	// Hex encoded md5 checksum of the object.
-	MD5Sum string
+	// Hex encoded unique entity tag of the object.
+	ETag string
 
 	// A standard MIME type describing the format of the object.
 	ContentType string
@@ -87,8 +96,27 @@ type ObjectInfo struct {
 	// by the Content-Type header field.
 	ContentEncoding string
 
+	// Specify object storage class
+	StorageClass string
+
 	// User-Defined metadata
 	UserDefined map[string]string
+
+	// List of individual parts, maximum size of upto 10,000
+	Parts []objectPartInfo `json:"-"`
+
+	// Implements writer and reader used by CopyObject API
+	Writer       io.WriteCloser `json:"-"`
+	Reader       *hash.Reader   `json:"-"`
+	PutObjReader *PutObjReader  `json:"-"`
+
+	metadataOnly bool
+
+	// Date and time when the object was last accessed.
+	AccTime time.Time
+
+	// backendType indicates which backend filled this structure
+	backendType BackendType
 }
 
 // ListPartsInfo - represents list of all parts.
@@ -120,7 +148,10 @@ type ListPartsInfo struct {
 	IsTruncated bool
 
 	// List of all parts.
-	Parts []partInfo
+	Parts []PartInfo
+
+	// Any metadata set during InitMultipartUpload, including encryption headers.
+	UserDefined map[string]string
 
 	EncodingType string // Not supported yet.
 }
@@ -155,7 +186,7 @@ type ListMultipartsInfo struct {
 	IsTruncated bool
 
 	// List of all pending uploads.
-	Uploads []uploadMetadata
+	Uploads []MultipartInfo
 
 	// When a prefix is provided in the request, The result contains only keys
 	// starting with the specified prefix.
@@ -195,8 +226,32 @@ type ListObjectsInfo struct {
 	Prefixes []string
 }
 
-// partInfo - represents individual part metadata.
-type partInfo struct {
+// ListObjectsV2Info - container for list objects version 2.
+type ListObjectsV2Info struct {
+	// Indicates whether the returned list objects response is truncated. A
+	// value of true indicates that the list was truncated. The list can be truncated
+	// if the number of objects exceeds the limit allowed or specified
+	// by max keys.
+	IsTruncated bool
+
+	// When response is truncated (the IsTruncated element value in the response
+	// is true), you can use the key name in this field as marker in the subsequent
+	// request to get next set of objects.
+	//
+	// NOTE: This element is returned only if you have delimiter request parameter
+	// specified.
+	ContinuationToken     string
+	NextContinuationToken string
+
+	// List of objects info for this request.
+	Objects []ObjectInfo
+
+	// List of prefixes for this request.
+	Prefixes []string
+}
+
+// PartInfo - represents individual part metadata.
+type PartInfo struct {
 	// Part number that identifies the part. This is a positive integer between
 	// 1 and 10,000.
 	PartNumber int
@@ -209,10 +264,13 @@ type partInfo struct {
 
 	// Size in bytes of the part.
 	Size int64
+
+	// Decompressed Size.
+	ActualSize int64
 }
 
-// uploadMetadata - represents metadata in progress multipart upload.
-type uploadMetadata struct {
+// MultipartInfo - represents metadata in progress multipart upload.
+type MultipartInfo struct {
 	// Object name for which the multipart upload was initiated.
 	Object string
 
@@ -225,8 +283,9 @@ type uploadMetadata struct {
 	StorageClass string // Not supported yet.
 }
 
-// completePart - completed part container.
-type completePart struct {
+// CompletePart - represents the part that was completed, this is sent by the client
+// during CompleteMultipartUpload request.
+type CompletePart struct {
 	// Part number identifying the part. This is a positive integer between 1 and
 	// 10,000
 	PartNumber int
@@ -235,14 +294,15 @@ type completePart struct {
 	ETag string
 }
 
-// completedParts - is a collection satisfying sort.Interface.
-type completedParts []completePart
+// CompletedParts - is a collection satisfying sort.Interface.
+type CompletedParts []CompletePart
 
-func (a completedParts) Len() int           { return len(a) }
-func (a completedParts) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a completedParts) Less(i, j int) bool { return a[i].PartNumber < a[j].PartNumber }
+func (a CompletedParts) Len() int           { return len(a) }
+func (a CompletedParts) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a CompletedParts) Less(i, j int) bool { return a[i].PartNumber < a[j].PartNumber }
 
-// completeMultipartUpload - represents input fields for completing multipart upload.
-type completeMultipartUpload struct {
-	Parts []completePart `xml:"Part"`
+// CompleteMultipartUpload - represents list of parts which are completed, this is sent by the
+// client during CompleteMultipartUpload request.
+type CompleteMultipartUpload struct {
+	Parts []CompletePart `xml:"Part"`
 }

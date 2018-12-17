@@ -24,10 +24,14 @@
 <!--- How has this issue affected you? What are you trying to accomplish? -->
 <!--- Providing context helps us come up with a solution that is most useful in the real world -->
 
+## Regression
+<!-- Is this issue a regression? (Yes / No) -->
+<!-- If Yes, optionally please include minio version or commit id or PR# that caused this regression, if you have these details. -->
+
 ## Your Environment
 <!--- Include as many relevant details about the environment you experienced the bug in -->
-* Version used:
+* Version used (`minio version`):
 * Environment name and version (e.g. nginx 1.9.1):
 * Server type and version:
-* Operating System and version:
+* Operating System and version (`uname -a`):
 * Link to your project:

@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016 Minio, Inc.
+ * Minio Cloud Storage, (C) 2016, 2017 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,11 +17,12 @@
 package cmd
 
 import (
-	"net/url"
+	"os"
 	"runtime"
 	"sync"
 	"testing"
-	"time"
+
+	"github.com/minio/dsync"
 )
 
 // Helper function to test equality of locks (without taking timing info into account)
@@ -33,7 +34,7 @@ func testLockEquality(lriLeft, lriRight []lockRequesterInfo) bool {
 	for i := 0; i < len(lriLeft); i++ {
 		if lriLeft[i].writer != lriRight[i].writer ||
 			lriLeft[i].node != lriRight[i].node ||
-			lriLeft[i].rpcPath != lriRight[i].rpcPath ||
+			lriLeft[i].serviceEndpoint != lriRight[i].serviceEndpoint ||
 			lriLeft[i].uid != lriRight[i].uid {
 			return false
 		}
@@ -42,45 +43,47 @@ func testLockEquality(lriLeft, lriRight []lockRequesterInfo) bool {
 }
 
 // Helper function to create a lock server for testing
-func createLockTestServer(t *testing.T) (string, *lockServer, string) {
-	testPath, err := newTestConfig("us-east-1")
+func createLockTestServer(t *testing.T) (string, *lockRPCReceiver, string) {
+	obj, fsDir, err := prepareFS()
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err = newTestConfig(globalMinioDefaultRegion, obj); err != nil {
 		t.Fatalf("unable initialize config file, %s", err)
 	}
 
-	locker := &lockServer{
-		loginServer: loginServer{},
-		rpcPath:     "rpc-path",
-		mutex:       sync.Mutex{},
-		lockMap:     make(map[string][]lockRequesterInfo),
+	locker := &lockRPCReceiver{
+		ll: localLocker{
+			mutex:           sync.Mutex{},
+			serviceEndpoint: "rpc-path",
+			lockMap:         make(map[string][]lockRequesterInfo),
+		},
 	}
-	creds := serverConfig.GetCredential()
-	loginArgs := RPCLoginArgs{Username: creds.AccessKeyID, Password: creds.SecretAccessKey}
-	loginReply := RPCLoginReply{}
-	err = locker.LoginHandler(&loginArgs, &loginReply)
+	creds := globalServerConfig.GetCredential()
+	token, err := authenticateNode(creds.AccessKey, creds.SecretKey)
 	if err != nil {
-		t.Fatalf("Failed to login to lock server - %v", err)
+		t.Fatal(err)
 	}
-	token := loginReply.Token
-
-	return testPath, locker, token
+	return fsDir, locker, token
 }
 
 // Test Lock functionality
 func TestLockRpcServerLock(t *testing.T) {
-
-	timestamp := time.Now().UTC()
 	testPath, locker, token := createLockTestServer(t)
-	defer removeAll(testPath)
+	defer os.RemoveAll(testPath)
 
 	la := LockArgs{
-		Name:      "name",
-		Token:     token,
-		Timestamp: timestamp,
-		Node:      "node",
-		RPCPath:   "rpc-path",
-		UID:       "0123-4567",
-	}
+		AuthArgs: AuthArgs{
+			Token:       token,
+			RPCVersion:  globalRPCAPIVersion,
+			RequestTime: UTCNow(),
+		},
+		LockArgs: dsync.LockArgs{
+			UID:             "0123-4567",
+			Resource:        "name",
+			ServerAddr:      "node",
+			ServiceEndpoint: "rpc-path",
+		}}
 
 	// Claim a lock
 	var result bool
@@ -91,13 +94,13 @@ func TestLockRpcServerLock(t *testing.T) {
 		if !result {
 			t.Errorf("Expected %#v, got %#v", true, result)
 		} else {
-			gotLri, _ := locker.lockMap["name"]
+			gotLri, _ := locker.ll.lockMap["name"]
 			expectedLri := []lockRequesterInfo{
 				{
-					writer:  true,
-					node:    "node",
-					rpcPath: "rpc-path",
-					uid:     "0123-4567",
+					writer:          true,
+					node:            "node",
+					serviceEndpoint: "rpc-path",
+					uid:             "0123-4567",
 				},
 			}
 			if !testLockEquality(expectedLri, gotLri) {
@@ -108,13 +111,18 @@ func TestLockRpcServerLock(t *testing.T) {
 
 	// Try to claim same lock again (will fail)
 	la2 := LockArgs{
-		Name:      "name",
-		Token:     token,
-		Timestamp: timestamp,
-		Node:      "node",
-		RPCPath:   "rpc-path",
-		UID:       "89ab-cdef",
-	}
+		AuthArgs: AuthArgs{
+			Token:       token,
+			RPCVersion:  globalRPCAPIVersion,
+			RequestTime: UTCNow(),
+		},
+		LockArgs: dsync.LockArgs{
+			UID:             "89ab-cdef",
+			Resource:        "name",
+			ServerAddr:      "node",
+			ServiceEndpoint: "rpc-path",
+		}}
+
 	err = locker.Lock(&la2, &result)
 	if err != nil {
 		t.Errorf("Expected %#v, got %#v", nil, err)
@@ -127,19 +135,21 @@ func TestLockRpcServerLock(t *testing.T) {
 
 // Test Unlock functionality
 func TestLockRpcServerUnlock(t *testing.T) {
-
-	timestamp := time.Now().UTC()
 	testPath, locker, token := createLockTestServer(t)
-	defer removeAll(testPath)
+	defer os.RemoveAll(testPath)
 
 	la := LockArgs{
-		Name:      "name",
-		Token:     token,
-		Timestamp: timestamp,
-		Node:      "node",
-		RPCPath:   "rpc-path",
-		UID:       "0123-4567",
-	}
+		AuthArgs: AuthArgs{
+			Token:       token,
+			RPCVersion:  globalRPCAPIVersion,
+			RequestTime: UTCNow(),
+		},
+		LockArgs: dsync.LockArgs{
+			UID:             "0123-4567",
+			Resource:        "name",
+			ServerAddr:      "node",
+			ServiceEndpoint: "rpc-path",
+		}}
 
 	// First test return of error when attempting to unlock a lock that does not exist
 	var result bool
@@ -164,7 +174,7 @@ func TestLockRpcServerUnlock(t *testing.T) {
 		if !result {
 			t.Errorf("Expected %#v, got %#v", true, result)
 		} else {
-			gotLri, _ := locker.lockMap["name"]
+			gotLri, _ := locker.ll.lockMap["name"]
 			expectedLri := []lockRequesterInfo(nil)
 			if !testLockEquality(expectedLri, gotLri) {
 				t.Errorf("Expected %#v, got %#v", expectedLri, gotLri)
@@ -175,19 +185,21 @@ func TestLockRpcServerUnlock(t *testing.T) {
 
 // Test RLock functionality
 func TestLockRpcServerRLock(t *testing.T) {
-
-	timestamp := time.Now().UTC()
 	testPath, locker, token := createLockTestServer(t)
-	defer removeAll(testPath)
+	defer os.RemoveAll(testPath)
 
 	la := LockArgs{
-		Name:      "name",
-		Token:     token,
-		Timestamp: timestamp,
-		Node:      "node",
-		RPCPath:   "rpc-path",
-		UID:       "0123-4567",
-	}
+		AuthArgs: AuthArgs{
+			Token:       token,
+			RPCVersion:  globalRPCAPIVersion,
+			RequestTime: UTCNow(),
+		},
+		LockArgs: dsync.LockArgs{
+			UID:             "0123-4567",
+			Resource:        "name",
+			ServerAddr:      "node",
+			ServiceEndpoint: "rpc-path",
+		}}
 
 	// Claim a lock
 	var result bool
@@ -198,13 +210,13 @@ func TestLockRpcServerRLock(t *testing.T) {
 		if !result {
 			t.Errorf("Expected %#v, got %#v", true, result)
 		} else {
-			gotLri, _ := locker.lockMap["name"]
+			gotLri, _ := locker.ll.lockMap["name"]
 			expectedLri := []lockRequesterInfo{
 				{
-					writer:  false,
-					node:    "node",
-					rpcPath: "rpc-path",
-					uid:     "0123-4567",
+					writer:          false,
+					node:            "node",
+					serviceEndpoint: "rpc-path",
+					uid:             "0123-4567",
 				},
 			}
 			if !testLockEquality(expectedLri, gotLri) {
@@ -215,13 +227,18 @@ func TestLockRpcServerRLock(t *testing.T) {
 
 	// Try to claim same again (will succeed)
 	la2 := LockArgs{
-		Name:      "name",
-		Token:     token,
-		Timestamp: timestamp,
-		Node:      "node",
-		RPCPath:   "rpc-path",
-		UID:       "89ab-cdef",
-	}
+		AuthArgs: AuthArgs{
+			Token:       token,
+			RPCVersion:  globalRPCAPIVersion,
+			RequestTime: UTCNow(),
+		},
+		LockArgs: dsync.LockArgs{
+			UID:             "89ab-cdef",
+			Resource:        "name",
+			ServerAddr:      "node",
+			ServiceEndpoint: "rpc-path",
+		}}
+
 	err = locker.RLock(&la2, &result)
 	if err != nil {
 		t.Errorf("Expected %#v, got %#v", nil, err)
@@ -234,19 +251,21 @@ func TestLockRpcServerRLock(t *testing.T) {
 
 // Test RUnlock functionality
 func TestLockRpcServerRUnlock(t *testing.T) {
-
-	timestamp := time.Now().UTC()
 	testPath, locker, token := createLockTestServer(t)
-	defer removeAll(testPath)
+	defer os.RemoveAll(testPath)
 
 	la := LockArgs{
-		Name:      "name",
-		Token:     token,
-		Timestamp: timestamp,
-		Node:      "node",
-		RPCPath:   "rpc-path",
-		UID:       "0123-4567",
-	}
+		AuthArgs: AuthArgs{
+			Token:       token,
+			RPCVersion:  globalRPCAPIVersion,
+			RequestTime: UTCNow(),
+		},
+		LockArgs: dsync.LockArgs{
+			UID:             "0123-4567",
+			Resource:        "name",
+			ServerAddr:      "node",
+			ServiceEndpoint: "rpc-path",
+		}}
 
 	// First test return of error when attempting to unlock a read-lock that does not exist
 	var result bool
@@ -263,14 +282,19 @@ func TestLockRpcServerRUnlock(t *testing.T) {
 		t.Errorf("Expected %#v, got %#v", true, result)
 	}
 
+	// Try to claim same again (will succeed)
 	la2 := LockArgs{
-		Name:      "name",
-		Token:     token,
-		Timestamp: timestamp,
-		Node:      "node",
-		RPCPath:   "rpc-path",
-		UID:       "89ab-cdef",
-	}
+		AuthArgs: AuthArgs{
+			Token:       token,
+			RPCVersion:  globalRPCAPIVersion,
+			RequestTime: UTCNow(),
+		},
+		LockArgs: dsync.LockArgs{
+			UID:             "89ab-cdef",
+			Resource:        "name",
+			ServerAddr:      "node",
+			ServiceEndpoint: "rpc-path",
+		}}
 
 	// ... and create a second lock on same resource
 	err = locker.RLock(&la2, &result)
@@ -288,13 +312,13 @@ func TestLockRpcServerRUnlock(t *testing.T) {
 		if !result {
 			t.Errorf("Expected %#v, got %#v", true, result)
 		} else {
-			gotLri, _ := locker.lockMap["name"]
+			gotLri, _ := locker.ll.lockMap["name"]
 			expectedLri := []lockRequesterInfo{
 				{
-					writer:  false,
-					node:    "node",
-					rpcPath: "rpc-path",
-					uid:     "89ab-cdef",
+					writer:          false,
+					node:            "node",
+					serviceEndpoint: "rpc-path",
+					uid:             "89ab-cdef",
 				},
 			}
 			if !testLockEquality(expectedLri, gotLri) {
@@ -312,7 +336,7 @@ func TestLockRpcServerRUnlock(t *testing.T) {
 		if !result {
 			t.Errorf("Expected %#v, got %#v", true, result)
 		} else {
-			gotLri, _ := locker.lockMap["name"]
+			gotLri, _ := locker.ll.lockMap["name"]
 			expectedLri := []lockRequesterInfo(nil)
 			if !testLockEquality(expectedLri, gotLri) {
 				t.Errorf("Expected %#v, got %#v", expectedLri, gotLri)
@@ -323,19 +347,21 @@ func TestLockRpcServerRUnlock(t *testing.T) {
 
 // Test ForceUnlock functionality
 func TestLockRpcServerForceUnlock(t *testing.T) {
-
-	timestamp := time.Now().UTC()
 	testPath, locker, token := createLockTestServer(t)
-	defer removeAll(testPath)
+	defer os.RemoveAll(testPath)
 
 	laForce := LockArgs{
-		Name:      "name",
-		Token:     token,
-		Timestamp: timestamp,
-		Node:      "node",
-		RPCPath:   "rpc-path",
-		UID:       "1234-5678",
-	}
+		AuthArgs: AuthArgs{
+			Token:       token,
+			RPCVersion:  globalRPCAPIVersion,
+			RequestTime: UTCNow(),
+		},
+		LockArgs: dsync.LockArgs{
+			UID:             "1234-5678",
+			Resource:        "name",
+			ServerAddr:      "node",
+			ServiceEndpoint: "rpc-path",
+		}}
 
 	// First test that UID should be empty
 	var result bool
@@ -345,20 +371,24 @@ func TestLockRpcServerForceUnlock(t *testing.T) {
 	}
 
 	// Then test force unlock of a lock that does not exist (not returning an error)
-	laForce.UID = ""
+	laForce.LockArgs.UID = ""
 	err = locker.ForceUnlock(&laForce, &result)
 	if err != nil {
 		t.Errorf("Expected no error, got %#v", err)
 	}
 
 	la := LockArgs{
-		Name:      "name",
-		Token:     token,
-		Timestamp: timestamp,
-		Node:      "node",
-		RPCPath:   "rpc-path",
-		UID:       "0123-4567",
-	}
+		AuthArgs: AuthArgs{
+			Token:       token,
+			RPCVersion:  globalRPCAPIVersion,
+			RequestTime: UTCNow(),
+		},
+		LockArgs: dsync.LockArgs{
+			UID:             "0123-4567",
+			Resource:        "name",
+			ServerAddr:      "node",
+			ServiceEndpoint: "rpc-path",
+		}}
 
 	// Create lock ... (so that we can force unlock)
 	err = locker.Lock(&la, &result)
@@ -391,18 +421,21 @@ func TestLockRpcServerForceUnlock(t *testing.T) {
 
 // Test Expired functionality
 func TestLockRpcServerExpired(t *testing.T) {
-	timestamp := time.Now().UTC()
 	testPath, locker, token := createLockTestServer(t)
-	defer removeAll(testPath)
+	defer os.RemoveAll(testPath)
 
 	la := LockArgs{
-		Name:      "name",
-		Token:     token,
-		Timestamp: timestamp,
-		Node:      "node",
-		RPCPath:   "rpc-path",
-		UID:       "0123-4567",
-	}
+		AuthArgs: AuthArgs{
+			Token:       token,
+			RPCVersion:  globalRPCAPIVersion,
+			RequestTime: UTCNow(),
+		},
+		LockArgs: dsync.LockArgs{
+			UID:             "0123-4567",
+			Resource:        "name",
+			ServerAddr:      "node",
+			ServiceEndpoint: "rpc-path",
+		}}
 
 	// Unknown lock at server will return expired = true
 	var expired bool
@@ -434,73 +467,75 @@ func TestLockRpcServerExpired(t *testing.T) {
 	}
 }
 
-// Test initialization of lock servers.
-func TestLockServers(t *testing.T) {
-	if runtime.GOOS == "windows" {
+// Test initialization of lock server.
+func TestLockServerInit(t *testing.T) {
+	if runtime.GOOS == globalWindowsOSName {
 		return
 	}
+
+	obj, fsDir, err := prepareFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(fsDir)
+	if err = newTestConfig(globalMinioDefaultRegion, obj); err != nil {
+		t.Fatalf("unable initialize config file, %s", err)
+	}
+
+	currentIsDistXL := globalIsDistXL
+	currentLockServer := globalLockServer
+	defer func() {
+		globalIsDistXL = currentIsDistXL
+		globalLockServer = currentLockServer
+	}()
+
+	case1Endpoints := mustGetNewEndpointList(
+		"http://localhost:9000/mnt/disk1",
+		"http://1.1.1.2:9000/mnt/disk2",
+		"http://1.1.2.1:9000/mnt/disk3",
+		"http://1.1.2.2:9000/mnt/disk4",
+	)
+	for i := range case1Endpoints {
+		if case1Endpoints[i].Host == "localhost:9000" {
+			case1Endpoints[i].IsLocal = true
+		}
+	}
+
+	case2Endpoints := mustGetNewEndpointList(
+		"http://localhost:9000/mnt/disk1",
+		"http://localhost:9000/mnt/disk2",
+		"http://1.1.2.1:9000/mnt/disk3",
+		"http://1.1.2.2:9000/mnt/disk4",
+	)
+	for i := range case2Endpoints {
+		if case2Endpoints[i].Host == "localhost:9000" {
+			case2Endpoints[i].IsLocal = true
+		}
+	}
+
 	globalMinioHost = ""
 	testCases := []struct {
-		isDistXL         bool
-		srvCmdConfig     serverCmdConfig
-		totalLockServers int
+		isDistXL  bool
+		endpoints EndpointList
 	}{
 		// Test - 1 one lock server initialized.
-		{
-			isDistXL: true,
-			srvCmdConfig: serverCmdConfig{
-				endpoints: []*url.URL{{
-					Scheme: "http",
-					Host:   "localhost:9000",
-					Path:   "/mnt/disk1",
-				}, {
-					Scheme: "http",
-					Host:   "1.1.1.2:9000",
-					Path:   "/mnt/disk2",
-				}, {
-					Scheme: "http",
-					Host:   "1.1.2.1:9000",
-					Path:   "/mnt/disk3",
-				}, {
-					Scheme: "http",
-					Host:   "1.1.2.2:9000",
-					Path:   "/mnt/disk4",
-				}},
-			},
-			totalLockServers: 1,
-		},
-		// Test - 2 two servers possible.
-		{
-			isDistXL: true,
-			srvCmdConfig: serverCmdConfig{
-				endpoints: []*url.URL{{
-					Scheme: "http",
-					Host:   "localhost:9000",
-					Path:   "/mnt/disk1",
-				}, {
-					Scheme: "http",
-					Host:   "localhost:9000",
-					Path:   "/mnt/disk2",
-				}, {
-					Scheme: "http",
-					Host:   "1.1.2.1:9000",
-					Path:   "/mnt/disk3",
-				}, {
-					Scheme: "http",
-					Host:   "1.1.2.2:9000",
-					Path:   "/mnt/disk4",
-				}},
-			},
-			totalLockServers: 2,
-		},
+		{true, case1Endpoints},
+		// Test - similar endpoint hosts should
+		// converge to single lock server
+		// initialized.
+		{true, case2Endpoints},
 	}
 
 	// Validates lock server initialization.
 	for i, testCase := range testCases {
 		globalIsDistXL = testCase.isDistXL
-		lockServers := newLockServers(testCase.srvCmdConfig)
-		if len(lockServers) != testCase.totalLockServers {
-			t.Fatalf("Test %d: Expected total %d, got %d", i+1, testCase.totalLockServers, len(lockServers))
+		globalLockServer = nil
+		_, _ = newDsyncNodes(testCase.endpoints)
+		if err != nil {
+			t.Fatalf("Got unexpected error initializing lock servers: %v", err)
+		}
+		if globalLockServer == nil && testCase.isDistXL {
+			t.Errorf("Test %d: Expected initialized lock RPC receiver, but got uninitialized", i+1)
 		}
 	}
 }

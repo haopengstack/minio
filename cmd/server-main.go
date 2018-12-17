@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2015, 2016 Minio, Inc.
+ * Minio Cloud Storage, (C) 2015, 2016, 2017, 2018 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,482 +17,404 @@
 package cmd
 
 import (
+	"context"
+	"errors"
 	"fmt"
-	"io/ioutil"
-	"net"
 	"net/http"
-	"net/url"
 	"os"
+	"os/signal"
 	"strings"
-
-	"regexp"
-	"runtime"
+	"syscall"
 
 	"github.com/minio/cli"
+	"github.com/minio/dsync"
+	xhttp "github.com/minio/minio/cmd/http"
+	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/certs"
 )
+
+func init() {
+	logger.Init(GOPATH, GOROOT)
+	logger.RegisterUIError(fmtError)
+}
 
 var serverFlags = []cli.Flag{
 	cli.StringFlag{
 		Name:  "address",
-		Value: ":9000",
-		Usage: `Bind to a specific IP:PORT. Defaults to ":9000".`,
+		Value: ":" + globalMinioPort,
+		Usage: "bind to a specific ADDRESS:PORT, ADDRESS can be an IP or hostname",
 	},
 }
 
 var serverCmd = cli.Command{
 	Name:   "server",
-	Usage:  "Start object storage server.",
+	Usage:  "start object storage server",
 	Flags:  append(serverFlags, globalFlags...),
 	Action: serverMain,
 	CustomHelpTemplate: `NAME:
-  minio {{.Name}} - {{.Usage}}
+  {{.HelpName}} - {{.Usage}}
 
 USAGE:
-  minio {{.Name}} [FLAGS] PATH [PATH...]
+  {{.HelpName}} {{if .VisibleFlags}}[FLAGS] {{end}}DIR1 [DIR2..]
+  {{.HelpName}} {{if .VisibleFlags}}[FLAGS] {{end}}DIR{1...64}
 
+DIR:
+  DIR points to a directory on a filesystem. When you want to combine
+  multiple drives into a single large system, pass one directory per
+  filesystem separated by space. You may also use a '...' convention
+  to abbreviate the directory arguments. Remote directories in a
+  distributed setup are encoded as HTTP(s) URIs.
+{{if .VisibleFlags}}
 FLAGS:
-  {{range .Flags}}{{.}}
-  {{end}}
+  {{range .VisibleFlags}}{{.}}
+  {{end}}{{end}}
 ENVIRONMENT VARIABLES:
   ACCESS:
-     MINIO_ACCESS_KEY: Custom username or access key of 5 to 20 characters in length.
-     MINIO_SECRET_KEY: Custom password or secret key of 8 to 40 characters in length.
+     MINIO_ACCESS_KEY: Custom username or access key of minimum 3 characters in length.
+     MINIO_SECRET_KEY: Custom password or secret key of minimum 8 characters in length.
 
   BROWSER:
      MINIO_BROWSER: To disable web browser access, set this value to "off".
 
+  CACHE:
+     MINIO_CACHE_DRIVES: List of mounted drives or directories delimited by ";".
+     MINIO_CACHE_EXCLUDE: List of cache exclusion patterns delimited by ";".
+     MINIO_CACHE_EXPIRY: Cache expiry duration in days.
+     MINIO_CACHE_MAXUSE: Maximum permitted usage of the cache in percentage (0-100).
+
+  DOMAIN:
+     MINIO_DOMAIN: To enable virtual-host-style requests, set this value to Minio host domain name.
+
+  WORM:
+     MINIO_WORM: To turn on Write-Once-Read-Many in server, set this value to "on".
+
+  BUCKET-DNS:
+     MINIO_DOMAIN:    To enable bucket DNS requests, set this value to Minio host domain name.
+     MINIO_PUBLIC_IPS: To enable bucket DNS requests, set this value to list of Minio host public IP(s) delimited by ",".
+     MINIO_ETCD_ENDPOINTS: To enable bucket DNS requests, set this value to list of etcd endpoints delimited by ",".
+
+   KMS:
+     MINIO_SSE_VAULT_ENDPOINT: To enable Vault as KMS,set this value to Vault endpoint.
+     MINIO_SSE_VAULT_APPROLE_ID: To enable Vault as KMS,set this value to Vault AppRole ID.
+     MINIO_SSE_VAULT_APPROLE_SECRET: To enable Vault as KMS,set this value to Vault AppRole Secret ID.
+     MINIO_SSE_VAULT_KEY_NAME: To enable Vault as KMS,set this value to Vault encryption key-ring name.
+
 EXAMPLES:
   1. Start minio server on "/home/shared" directory.
-      $ minio {{.Name}} /home/shared
+     $ {{.HelpName}} /home/shared
 
-  2. Start minio server bound to a specific IP:PORT.
-      $ minio {{.Name}} --address 192.168.1.101:9000 /home/shared
+  2. Start minio server bound to a specific ADDRESS:PORT.
+     $ {{.HelpName}} --address 192.168.1.101:9000 /home/shared
 
-  3. Start erasure coded minio server on a 12 disks server.
-      $ minio {{.Name}} /mnt/export1/ /mnt/export2/ /mnt/export3/ /mnt/export4/ \
-          /mnt/export5/ /mnt/export6/ /mnt/export7/ /mnt/export8/ /mnt/export9/ \
-          /mnt/export10/ /mnt/export11/ /mnt/export12/
+  3. Start minio server and enable virtual-host-style requests.
+     $ export MINIO_DOMAIN=mydomain.com
+     $ {{.HelpName}} --address mydomain.com:9000 /mnt/export
 
-  4. Start erasure coded distributed minio server on a 4 node setup with 1 drive each. Run following commands on all the 4 nodes.
-      $ export MINIO_ACCESS_KEY=minio
-      $ export MINIO_SECRET_KEY=miniostorage
-      $ minio {{.Name}} http://192.168.1.11/mnt/export/ http://192.168.1.12/mnt/export/ \
-          http://192.168.1.13/mnt/export/ http://192.168.1.14/mnt/export/
+  4. Start erasure coded minio server on a node with 64 drives.
+     $ {{.HelpName}} /mnt/export{1...64}
 
+  5. Start distributed minio server on an 32 node setup with 32 drives each. Run following command on all the 32 nodes.
+     $ export MINIO_ACCESS_KEY=minio
+     $ export MINIO_SECRET_KEY=miniostorage
+     $ {{.HelpName}} http://node{1...32}.example.com/mnt/export/{1...32}
+
+  6. Start minio server with edge caching enabled.
+     $ export MINIO_CACHE_DRIVES="/mnt/drive1;/mnt/drive2;/mnt/drive3;/mnt/drive4"
+     $ export MINIO_CACHE_EXCLUDE="bucket1/*;*.png"
+     $ export MINIO_CACHE_EXPIRY=40
+     $ export MINIO_CACHE_MAXUSE=80
+     $ {{.HelpName}} /home/shared
+
+  7. Start minio server with KMS enabled.
+     $ export MINIO_SSE_VAULT_APPROLE_ID=9b56cc08-8258-45d5-24a3-679876769126
+     $ export MINIO_SSE_VAULT_APPROLE_SECRET=4e30c52f-13e4-a6f5-0763-d50e8cb4321f
+     $ export MINIO_SSE_VAULT_ENDPOINT=https://vault-endpoint-ip:8200
+     $ export MINIO_SSE_VAULT_KEY_NAME=my-minio-key
+     $ {{.HelpName}} /home/shared
 `,
 }
 
-type serverCmdConfig struct {
-	serverAddr   string
-	endpoints    []*url.URL
-	storageDisks []StorageAPI
+// Checks if endpoints are either available through environment
+// or command line, returns false if both fails.
+func endpointsPresent(ctx *cli.Context) bool {
+	_, ok := os.LookupEnv("MINIO_ENDPOINTS")
+	if !ok {
+		ok = ctx.Args().Present()
+	}
+	return ok
 }
 
-// Parse an array of end-points (from the command line)
-func parseStorageEndpoints(eps []string) (endpoints []*url.URL, err error) {
-	for _, ep := range eps {
-		if ep == "" {
-			return nil, errInvalidArgument
-		}
-		var u *url.URL
-		u, err = url.Parse(ep)
-		if err != nil {
-			return nil, err
-		}
-		if u.Host != "" {
-			_, port, err := net.SplitHostPort(u.Host)
-			// Ignore the missing port error as the default port can be globalMinioPort.
-			if err != nil && !strings.Contains(err.Error(), "missing port in address") {
-				return nil, err
-			}
+func serverHandleCmdArgs(ctx *cli.Context) {
+	// Handle common command args.
+	handleCommonCmdArgs(ctx)
 
-			if globalMinioHost == "" {
-				// For ex.: minio server host1:port1 host2:port2...
-				// we return error as port is configurable only
-				// using "--address :port"
-				if port != "" {
-					errorIf(fmt.Errorf("Invalid argument %s, port configurable using --address :<port>", u.Host), "")
-					return nil, errInvalidArgument
-				}
-				u.Host = net.JoinHostPort(u.Host, globalMinioPort)
-			} else {
-				// For ex.: minio server --address host:port host1:port1 host2:port2...
-				// i.e if "--address host:port" is specified
-				// port info in u.Host is mandatory else return error.
-				if port == "" {
-					errorIf(fmt.Errorf("Invalid argument %s, port mandatory when --address <host>:<port> is used", u.Host), "")
-					return nil, errInvalidArgument
-				}
-			}
-		}
-		endpoints = append(endpoints, u)
-	}
-	return endpoints, nil
-}
+	// Server address.
+	serverAddr := ctx.String("address")
+	logger.FatalIf(CheckLocalServerAddr(serverAddr), "Unable to validate passed arguments")
 
-// getListenIPs - gets all the ips to listen on.
-func getListenIPs(serverAddr string) (hosts []string, port string, err error) {
-	var host string
-	host, port, err = net.SplitHostPort(serverAddr)
-	if err != nil {
-		return nil, port, fmt.Errorf("Unable to parse host address %s", err)
-	}
-	if host == "" {
-		var ipv4s []net.IP
-		ipv4s, err = getInterfaceIPv4s()
-		if err != nil {
-			return nil, port, fmt.Errorf("Unable reverse sorted ips from hosts %s", err)
-		}
-		for _, ip := range ipv4s {
-			hosts = append(hosts, ip.String())
-		}
-		return hosts, port, nil
-	} // if host != "" {
-	// Proceed to append itself, since user requested a specific endpoint.
-	hosts = append(hosts, host)
-	return hosts, port, nil
-}
+	var setupType SetupType
+	var err error
 
-// Finalizes the endpoints based on the host list and port.
-func finalizeEndpoints(tls bool, apiServer *http.Server) (endPoints []string) {
-	// Verify current scheme.
-	scheme := "http"
-	if tls {
-		scheme = "https"
+	if len(ctx.Args()) > serverCommandLineArgsMax {
+		uErr := uiErrInvalidErasureEndpoints(nil).Msg(fmt.Sprintf("Invalid total number of endpoints (%d) passed, supported upto 32 unique arguments",
+			len(ctx.Args())))
+		logger.FatalIf(uErr, "Unable to validate passed endpoints")
 	}
 
-	// Get list of listen ips and port.
-	hosts, port, err := getListenIPs(apiServer.Addr)
-	fatalIf(err, "Unable to get list of ips to listen on")
-
-	// Construct proper endpoints.
-	for _, host := range hosts {
-		endPoints = append(endPoints, fmt.Sprintf("%s://%s:%s", scheme, host, port))
+	endpoints := strings.Fields(os.Getenv("MINIO_ENDPOINTS"))
+	if len(endpoints) > 0 {
+		globalMinioAddr, globalEndpoints, setupType, globalXLSetCount, globalXLSetDriveCount, err = createServerEndpoints(serverAddr, endpoints...)
+	} else {
+		globalMinioAddr, globalEndpoints, setupType, globalXLSetCount, globalXLSetDriveCount, err = createServerEndpoints(serverAddr, ctx.Args()...)
 	}
+	logger.FatalIf(err, "Invalid command line arguments")
 
-	// Success.
-	return endPoints
-}
+	globalMinioHost, globalMinioPort = mustSplitHostPort(globalMinioAddr)
 
-// loadRootCAs fetches CA files provided in minio config and adds them to globalRootCAs
-// Currently under Windows, there is no way to load system + user CAs at the same time
-func loadRootCAs() {
-	caFiles := mustGetCAFiles()
-	if len(caFiles) == 0 {
-		return
-	}
-	// Get system cert pool, and empty cert pool under Windows because it is not supported
-	globalRootCAs = mustGetSystemCertPool()
-	// Load custom root CAs for client requests
-	for _, caFile := range mustGetCAFiles() {
-		caCert, err := ioutil.ReadFile(caFile)
-		if err != nil {
-			fatalIf(err, "Unable to load a CA file")
-		}
-		globalRootCAs.AppendCertsFromPEM(caCert)
+	// On macOS, if a process already listens on LOCALIPADDR:PORT, net.Listen() falls back
+	// to IPv6 address ie minio will start listening on IPv6 address whereas another
+	// (non-)minio process is listening on IPv4 of given port.
+	// To avoid this error sutiation we check for port availability.
+	logger.FatalIf(checkPortAvailability(globalMinioPort), "Unable to start the server")
+
+	globalIsXL = (setupType == XLSetupType)
+	globalIsDistXL = (setupType == DistXLSetupType)
+	if globalIsDistXL {
+		globalIsXL = true
 	}
 }
 
-// initServerConfig initialize server config.
-func initServerConfig(c *cli.Context) {
-	// Create certs path.
-	err := createCertsPath()
-	fatalIf(err, "Unable to create \"certs\" directory.")
+func serverHandleEnvVars() {
+	// Handle common environment variables.
+	handleCommonEnvVars()
 
-	// Load user supplied root CAs
-	loadRootCAs()
-
-	// When credentials inherited from the env, server cmd has to save them in the disk
-	if os.Getenv("MINIO_ACCESS_KEY") != "" && os.Getenv("MINIO_SECRET_KEY") != "" {
-		// Env credentials are already loaded in serverConfig, just save in the disk
-		err = serverConfig.Save()
-		fatalIf(err, "Unable to save credentials in the disk.")
+	if serverRegion := os.Getenv("MINIO_REGION"); serverRegion != "" {
+		// region Envs are set globally.
+		globalIsEnvRegion = true
+		globalServerRegion = serverRegion
 	}
 
-	// Set maxOpenFiles, This is necessary since default operating
-	// system limits of 1024, 2048 are not enough for Minio server.
-	setMaxOpenFiles()
-
-	// Set maxMemory, This is necessary since default operating
-	// system limits might be changed and we need to make sure we
-	// do not crash the server so the set the maxCacheSize appropriately.
-	setMaxMemory()
-
-	// Do not fail if this is not allowed, lower limits are fine as well.
-}
-
-// Validate if input disks are sufficient for initializing XL.
-func checkSufficientDisks(eps []*url.URL) error {
-	// Verify total number of disks.
-	total := len(eps)
-	if total > maxErasureBlocks {
-		return errXLMaxDisks
-	}
-	if total < minErasureBlocks {
-		return errXLMinDisks
-	}
-
-	// isEven function to verify if a given number if even.
-	isEven := func(number int) bool {
-		return number%2 == 0
-	}
-
-	// Verify if we have even number of disks.
-	// only combination of 4, 6, 8, 10, 12, 14, 16 are supported.
-	if !isEven(total) {
-		return errXLNumDisks
-	}
-
-	// Success.
-	return nil
-}
-
-// Returns if slice of disks is a distributed setup.
-func isDistributedSetup(eps []*url.URL) bool {
-	// Validate if one the disks is not local.
-	for _, ep := range eps {
-		if !isLocalStorage(ep) {
-			// One or more disks supplied as arguments are
-			// not attached to the local node.
-			return true
-		}
-	}
-	return false
-}
-
-// Check if the endpoints are following expected syntax, i.e
-// valid scheme, valid path across all platforms.
-func checkEndpointsSyntax(eps []*url.URL, disks []string) error {
-	for i, u := range eps {
-		switch u.Scheme {
-		case "":
-			// "/" is not allowed.
-			if u.Path == "" || u.Path == "/" {
-				return fmt.Errorf("Root path is not allowed : %s (%s)", u.Path, disks[i])
-			}
-		case "http", "https":
-			// "http://server1/" is not allowed
-			if u.Path == "" || u.Path == "/" || u.Path == "\\" {
-				return fmt.Errorf("Root path is not allowed : %s (%s)", u.Path, disks[i])
-			}
-		default:
-			if runtime.GOOS == "windows" {
-				// On windows for "C:\export" scheme will be "C"
-				matched, err := regexp.MatchString("^[a-zA-Z]$", u.Scheme)
-				if err != nil {
-					return fmt.Errorf("Invalid scheme : %s (%s), ERROR %s", u.Scheme, disks[i], err)
-				}
-				if matched {
-					break
-				}
-			}
-			return fmt.Errorf("Invalid scheme : %s (%s)", u.Scheme, disks[i])
-		}
-	}
-	return nil
-}
-
-// Make sure all the command line parameters are OK and exit in case of invalid parameters.
-func checkServerSyntax(c *cli.Context) {
-	serverAddr := c.String("address")
-
-	host, portStr, err := net.SplitHostPort(serverAddr)
-	fatalIf(err, "Unable to parse %s.", serverAddr)
-
-	// Verify syntax for all the XL disks.
-	disks := c.Args()
-	endpoints, err := parseStorageEndpoints(disks)
-	fatalIf(err, "Unable to parse storage endpoints %s", strings.Join(disks, " "))
-
-	// Validate if endpoints follow the expected syntax.
-	err = checkEndpointsSyntax(endpoints, disks)
-	fatalIf(err, "Invalid endpoints found %s", strings.Join(disks, " "))
-
-	// Validate for duplicate endpoints are supplied.
-	err = checkDuplicateEndpoints(endpoints)
-	fatalIf(err, "Duplicate entries in %s", strings.Join(disks, " "))
-
-	if len(endpoints) > 1 {
-		// Validate if we have sufficient disks for XL setup.
-		err = checkSufficientDisks(endpoints)
-		fatalIf(err, "Storage endpoint error.")
-	}
-
-	if !isDistributedSetup(endpoints) {
-		// for FS and singlenode-XL validation is done, return.
-		return
-	}
-
-	// Rest of the checks applies only to distributed XL setup.
-	if host != "" {
-		// We are here implies --address host:port is passed, hence the user is trying
-		// to run one minio process per export disk.
-		if portStr == "" {
-			fatalIf(errInvalidArgument, "Port missing, Host:Port should be specified for --address")
-		}
-		foundCnt := 0
-		for _, ep := range endpoints {
-			if ep.Host == serverAddr {
-				foundCnt++
-			}
-		}
-		if foundCnt == 0 {
-			// --address host:port should be available in the XL disk list.
-			fatalIf(errInvalidArgument, "%s is not available in %s", serverAddr, strings.Join(disks, " "))
-		}
-		if foundCnt > 1 {
-			// --address host:port should match exactly one entry in the XL disk list.
-			fatalIf(errInvalidArgument, "%s matches % entries in %s", serverAddr, foundCnt, strings.Join(disks, " "))
-		}
-	}
-
-	tls := isSSL()
-	for _, ep := range endpoints {
-		if ep.Scheme == "https" && !tls {
-			// Certificates should be provided for https configuration.
-			fatalIf(errInvalidArgument, "Certificates not provided for https")
-		}
-	}
-}
-
-// Checks if any of the endpoints supplied is local to this server.
-func isAnyEndpointLocal(eps []*url.URL) bool {
-	anyLocalEp := false
-	for _, ep := range eps {
-		if isLocalStorage(ep) {
-			anyLocalEp = true
-			break
-		}
-	}
-	return anyLocalEp
 }
 
 // serverMain handler called for 'minio server' command.
-func serverMain(c *cli.Context) {
-	if !c.Args().Present() || c.Args().First() == "help" {
-		cli.ShowCommandHelpAndExit(c, "server", 1)
+func serverMain(ctx *cli.Context) {
+	if ctx.Args().First() == "help" || !endpointsPresent(ctx) {
+		cli.ShowCommandHelpAndExit(ctx, "server", 1)
 	}
 
-	// Set global variables after parsing passed arguments
-	setGlobalsFromContext(c)
+	// Disable logging until server initialization is complete, any
+	// error during initialization will be shown as a fatal message
+	logger.Disable = true
 
-	// Initialization routine, such as config loading, enable logging, ..
-	minioInit()
-
-	// Check for minio updates from dl.minio.io
-	checkUpdate()
-
-	// Server address.
-	serverAddr := c.String("address")
-
-	// Check if requested port is available.
-	host, portStr, err := net.SplitHostPort(serverAddr)
-	fatalIf(err, "Unable to parse %s.", serverAddr)
-	if portStr == "0" || portStr == "" {
-		// Port zero or empty means use requested to choose any freely available
-		// port. Avoid this since it won't work with any configured clients,
-		// can lead to serious loss of availability.
-		fatalIf(errInvalidArgument, "Invalid port `%s`, please use `--address` to pick a specific port", portStr)
-	}
-	globalMinioHost = host
-
-	// Check if requested port is available.
-	fatalIf(checkPortAvailability(portStr), "Port unavailable %s", portStr)
-	globalMinioPort = portStr
-
-	// Check server syntax and exit in case of errors.
-	// Done after globalMinioHost and globalMinioPort is set as parseStorageEndpoints()
-	// depends on it.
-	checkServerSyntax(c)
-
-	// Disks to be used in server init.
-	endpoints, err := parseStorageEndpoints(c.Args())
-	fatalIf(err, "Unable to parse storage endpoints %s", c.Args())
-
-	// Should exit gracefully if none of the endpoints passed
-	// as command line args are local to this server.
-	if !isAnyEndpointLocal(endpoints) {
-		fatalIf(errInvalidArgument, "None of the disks passed as command line args are local to this server.")
+	// Get "json" flag from command line argument and
+	// enable json and quite modes if jason flag is turned on.
+	jsonFlag := ctx.IsSet("json") || ctx.GlobalIsSet("json")
+	if jsonFlag {
+		logger.EnableJSON()
 	}
 
-	storageDisks, err := initStorageDisks(endpoints)
-	fatalIf(err, "Unable to initialize storage disk(s).")
-
-	// Cleanup objects that weren't successfully written into the namespace.
-	fatalIf(houseKeeping(storageDisks), "Unable to purge temporary files.")
-
-	// Initialize server config.
-	initServerConfig(c)
-
-	// First disk argument check if it is local.
-	firstDisk := isLocalStorage(endpoints[0])
-
-	// Check if endpoints are part of distributed setup.
-	globalIsDistXL = isDistributedSetup(endpoints)
-
-	// Configure server.
-	srvConfig := serverCmdConfig{
-		serverAddr:   serverAddr,
-		endpoints:    endpoints,
-		storageDisks: storageDisks,
+	// Get quiet flag from command line argument.
+	quietFlag := ctx.IsSet("quiet") || ctx.GlobalIsSet("quiet")
+	if quietFlag {
+		logger.EnableQuiet()
 	}
 
-	// Configure server.
-	handler, err := configureServerHandler(srvConfig)
-	fatalIf(err, "Unable to configure one of server's RPC services.")
+	// Handle all server command args.
+	serverHandleCmdArgs(ctx)
+
+	// Create certs path.
+	logger.FatalIf(createConfigDir(), "Unable to initialize configuration files")
+
+	// Check and load TLS certificates.
+	var err error
+	globalPublicCerts, globalTLSCerts, globalIsSSL, err = getTLSConfig()
+	logger.FatalIf(err, "Unable to load the TLS configuration")
+
+	// Check and load Root CAs.
+	globalRootCAs, err = getRootCAs(getCADir())
+	logger.FatalIf(err, "Failed to read root CAs (%v)", err)
+
+	// Handle all server environment vars.
+	serverHandleEnvVars()
+
+	// Is distributed setup, error out if no certificates are found for HTTPS endpoints.
+	if globalIsDistXL {
+		if globalEndpoints.IsHTTPS() && !globalIsSSL {
+			logger.Fatal(uiErrNoCertsAndHTTPSEndpoints(nil), "Unable to start the server")
+		}
+		if !globalEndpoints.IsHTTPS() && globalIsSSL {
+			logger.Fatal(uiErrCertsAndHTTPEndpoints(nil), "Unable to start the server")
+		}
+	}
+
+	if !quietFlag {
+		// Check for new updates from dl.minio.io.
+		mode := globalMinioModeFS
+		if globalIsDistXL {
+			mode = globalMinioModeDistXL
+		} else if globalIsXL {
+			mode = globalMinioModeXL
+		}
+		checkUpdate(mode)
+	}
+
+	// FIXME: This code should be removed in future releases and we should have mandatory
+	// check for ENVs credentials under distributed setup. Until all users migrate we
+	// are intentionally providing backward compatibility.
+	{
+		// Check for backward compatibility and newer style.
+		if !globalIsEnvCreds && globalIsDistXL {
+			// Try to load old config file if any, for backward compatibility.
+			var config = &serverConfig{}
+			if _, err = Load(getConfigFile(), config); err == nil {
+				globalActiveCred = config.Credential
+			}
+
+			if os.IsNotExist(err) {
+				if _, err = Load(getConfigFile()+".deprecated", config); err == nil {
+					globalActiveCred = config.Credential
+				}
+			}
+
+			if globalActiveCred.IsValid() {
+				// Credential is valid don't throw an error instead print a message regarding deprecation of 'config.json'
+				// based model and proceed to use it for now in distributed setup.
+				logger.Info(`Supplying credentials from your 'config.json' is **DEPRECATED**, Access key and Secret key in distributed server mode is expected to be specified with environment variables MINIO_ACCESS_KEY and MINIO_SECRET_KEY. This approach will become mandatory in future releases, please migrate to this approach soon.`)
+			} else {
+				// Credential is not available anywhere by both means, we cannot start distributed setup anymore, fail eagerly.
+				logger.Fatal(uiErrEnvCredentialsMissingDistributed(nil), "Unable to initialize the server in distributed mode")
+			}
+		}
+	}
+
+	// Set system resources to maximum.
+	logger.LogIf(context.Background(), setMaxResources())
 
 	// Set nodes for dsync for distributed setup.
 	if globalIsDistXL {
-		fatalIf(initDsyncNodes(endpoints), "Unable to initialize distributed locking")
+		globalDsync, err = dsync.New(newDsyncNodes(globalEndpoints))
+		if err != nil {
+			logger.Fatal(err, "Unable to initialize distributed locking on %s", globalEndpoints)
+		}
 	}
 
 	// Initialize name space lock.
 	initNSLock(globalIsDistXL)
 
-	// Initialize a new HTTP server.
-	apiServer := NewServerMux(serverAddr, handler)
+	// Init global heal state
+	initAllHealState(globalIsXL)
 
-	// If https.
-	tls := isSSL()
+	// Configure server.
+	var handler http.Handler
+	handler, err = configureServerHandler(globalEndpoints)
+	if err != nil {
+		logger.Fatal(uiErrUnexpectedError(err), "Unable to configure one of server's RPC services")
+	}
 
-	// Fetch endpoints which we are going to serve from.
-	endPoints := finalizeEndpoints(tls, apiServer.Server)
+	// Initialize Admin Peers inter-node communication only in distributed setup.
+	initGlobalAdminPeers(globalEndpoints)
 
-	// Initialize local server address
-	globalMinioAddr = getLocalAddress(srvConfig)
+	var getCert certs.GetCertificateFunc
+	if globalTLSCerts != nil {
+		getCert = globalTLSCerts.GetCertificate
+	}
 
-	// Initialize S3 Peers inter-node communication
-	initGlobalS3Peers(endpoints)
+	globalHTTPServer = xhttp.NewServer([]string{globalMinioAddr}, criticalErrorHandler{handler}, getCert)
+	globalHTTPServer.UpdateBytesReadFunc = globalConnStats.incInputBytes
+	globalHTTPServer.UpdateBytesWrittenFunc = globalConnStats.incOutputBytes
+	go func() {
+		globalHTTPServerErrorCh <- globalHTTPServer.Start()
+	}()
 
-	// Initialize Admin Peers inter-node communication
-	initGlobalAdminPeers(endpoints)
+	signal.Notify(globalOSSignalCh, os.Interrupt, syscall.SIGTERM)
 
-	// Start server, automatically configures TLS if certs are available.
-	go func(tls bool) {
-		var lerr error
-		cert, key := "", ""
-		if tls {
-			cert, key = mustGetCertFile(), mustGetKeyFile()
-		}
-		lerr = apiServer.ListenAndServe(cert, key)
-		fatalIf(lerr, "Failed to start minio server.")
-	}(tls)
+	newObject, err := newObjectLayer(globalEndpoints)
+	if err != nil {
+		// Stop watching for any certificate changes.
+		globalTLSCerts.Stop()
 
-	// Wait for formatting of disks.
-	formattedDisks, err := waitForFormatDisks(firstDisk, endpoints, storageDisks)
-	fatalIf(err, "formatting storage disks failed")
+		globalHTTPServer.Shutdown()
+		logger.FatalIf(err, "Unable to initialize backend")
+	}
 
-	// Once formatted, initialize object layer.
-	newObject, err := newObjectLayer(formattedDisks)
-	fatalIf(err, "intializing object layer failed")
+	// Populate existing buckets to the etcd backend
+	if globalDNSConfig != nil {
+		initFederatorBackend(newObject)
+	}
+
+	// Re-enable logging
+	logger.Disable = false
+
+	// Create a new config system.
+	globalConfigSys = NewConfigSys()
+
+	// Initialize config system.
+	if err = globalConfigSys.Init(newObject); err != nil {
+		logger.Fatal(err, "Unable to initialize config system")
+	}
+
+	// Load logger subsystem
+	loadLoggers()
+
+	var cacheConfig = globalServerConfig.GetCacheConfig()
+	if len(cacheConfig.Drives) > 0 {
+		// initialize the new disk cache objects.
+		globalCacheObjectAPI, err = newServerCacheObjects(cacheConfig)
+		logger.FatalIf(err, "Unable to initialize disk caching")
+	}
+
+	// Create new IAM system.
+	globalIAMSys = NewIAMSys()
+	if err = globalIAMSys.Init(newObject); err != nil {
+		logger.Fatal(err, "Unable to initialize IAM system")
+	}
+
+	// Create new policy system.
+	globalPolicySys = NewPolicySys()
+
+	// Initialize policy system.
+	if err = globalPolicySys.Init(newObject); err != nil {
+		logger.Fatal(err, "Unable to initialize policy system")
+	}
+
+	// Create new notification system.
+	globalNotificationSys = NewNotificationSys(globalServerConfig, globalEndpoints)
+
+	// Initialize notification system.
+	if err = globalNotificationSys.Init(newObject); err != nil {
+		logger.LogIf(context.Background(), err)
+	}
+	if globalAutoEncryption && !newObject.IsEncryptionSupported() {
+		logger.Fatal(errors.New("Invalid KMS configuration"), "auto-encryption is enabled but server does not support encryption")
+	}
 
 	globalObjLayerMutex.Lock()
 	globalObjectAPI = newObject
 	globalObjLayerMutex.Unlock()
 
 	// Prints the formatted startup message once object layer is initialized.
-	printStartupMessage(endPoints)
+	printStartupMessage(getAPIEndpoints())
 
-	// Waits on the server.
-	<-globalServiceDoneCh
+	// Set uptime time after object layer has initialized.
+	globalBootTime = UTCNow()
+
+	handleSignals()
+}
+
+// Initialize object layer with the supplied disks, objectLayer is nil upon any error.
+func newObjectLayer(endpoints EndpointList) (newObject ObjectLayer, err error) {
+	// For FS only, directly use the disk.
+
+	isFS := len(endpoints) == 1
+	if isFS {
+		// Initialize new FS object layer.
+		return NewFSObjectLayer(endpoints[0].Path)
+	}
+
+	format, err := waitForFormatXL(context.Background(), endpoints[0].IsLocal, endpoints, globalXLSetCount, globalXLSetDriveCount)
+	if err != nil {
+		return nil, err
+	}
+
+	return newXLSets(endpoints, format, len(format.XL.Sets), len(format.XL.Sets[0]))
 }

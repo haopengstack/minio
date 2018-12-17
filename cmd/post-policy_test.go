@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016 Minio, Inc.
+ * Minio Cloud Storage, (C) 2016, 2017, 2018 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,12 +18,14 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"fmt"
 	"io/ioutil"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
@@ -36,7 +38,7 @@ const (
 )
 
 func newPostPolicyBytesV4WithContentRange(credential, bucketName, objectKey string, expiration time.Time) []byte {
-	t := time.Now().UTC()
+	t := UTCNow()
 	// Add the expiration date.
 	expirationStr := fmt.Sprintf(`"expiration": "%s"`, expiration.Format(expirationDateFormat))
 	// Add the bucket condition, only accept buckets equal to the one passed.
@@ -65,7 +67,7 @@ func newPostPolicyBytesV4WithContentRange(credential, bucketName, objectKey stri
 
 // newPostPolicyBytesV4 - creates a bare bones postpolicy string with key and bucket matches.
 func newPostPolicyBytesV4(credential, bucketName, objectKey string, expiration time.Time) []byte {
-	t := time.Now().UTC()
+	t := UTCNow()
 	// Add the expiration date.
 	expirationStr := fmt.Sprintf(`"expiration": "%s"`, expiration.Format(expirationDateFormat))
 	// Add the bucket condition, only accept buckets equal to the one passed.
@@ -115,34 +117,27 @@ func TestPostPolicyBucketHandler(t *testing.T) {
 
 // testPostPolicyBucketHandler - Tests validate post policy handler uploading objects.
 func testPostPolicyBucketHandler(obj ObjectLayer, instanceType string, t TestErrHandler) {
-	root, err := newTestConfig("us-east-1")
-	if err != nil {
+	if err := newTestConfig(globalMinioDefaultRegion, obj); err != nil {
 		t.Fatalf("Initializing config.json failed")
-	}
-	defer removeAll(root)
-
-	// Register event notifier.
-	err = initEventNotifier(obj)
-	if err != nil {
-		t.Fatalf("Initializing event notifiers failed")
 	}
 
 	// get random bucket name.
 	bucketName := getRandomBucketName()
 
+	var opts ObjectOptions
 	// Register the API end points with XL/FS object layer.
 	apiRouter := initTestAPIEndPoints(obj, []string{"PostPolicy"})
 
-	credentials := serverConfig.GetCredential()
+	credentials := globalServerConfig.GetCredential()
 
-	curTime := time.Now().UTC()
+	curTime := UTCNow()
 	curTimePlus5Min := curTime.Add(time.Minute * 5)
 
 	// bucketnames[0].
 	// objectNames[0].
 	// uploadIds [0].
 	// Create bucket before initiating NewMultipartUpload.
-	err = obj.MakeBucket(bucketName)
+	err := obj.MakeBucketWithLocation(context.Background(), bucketName, "")
 	if err != nil {
 		// Failed to create newbucket, abort.
 		t.Fatalf("%s : %s", instanceType, err.Error())
@@ -154,9 +149,9 @@ func testPostPolicyBucketHandler(obj ObjectLayer, instanceType string, t TestErr
 		accessKey      string
 		secretKey      string
 	}{
-		{http.StatusForbidden, "invalidaccesskey", credentials.SecretAccessKey},
-		{http.StatusForbidden, credentials.AccessKeyID, "invalidsecretkey"},
-		{http.StatusNoContent, credentials.AccessKeyID, credentials.SecretAccessKey},
+		{http.StatusForbidden, "invalidaccesskey", credentials.SecretKey},
+		{http.StatusForbidden, credentials.AccessKey, "invalidsecretkey"},
+		{http.StatusNoContent, credentials.AccessKey, credentials.SecretKey},
 	}
 
 	for i, test := range testCasesV2 {
@@ -178,6 +173,7 @@ func testPostPolicyBucketHandler(obj ObjectLayer, instanceType string, t TestErr
 	testCasesV4 := []struct {
 		objectName         string
 		data               []byte
+		expectedHeaders    map[string]string
 		expectedRespStatus int
 		accessKey          string
 		secretKey          string
@@ -188,8 +184,9 @@ func testPostPolicyBucketHandler(obj ObjectLayer, instanceType string, t TestErr
 			objectName:         "test",
 			data:               []byte("Hello, World"),
 			expectedRespStatus: http.StatusNoContent,
-			accessKey:          credentials.AccessKeyID,
-			secretKey:          credentials.SecretAccessKey,
+			expectedHeaders:    map[string]string{"X-Amz-Meta-Uuid": "1234"},
+			accessKey:          credentials.AccessKey,
+			secretKey:          credentials.SecretKey,
 			malformedBody:      false,
 		},
 		// Bad case invalid request.
@@ -206,8 +203,8 @@ func testPostPolicyBucketHandler(obj ObjectLayer, instanceType string, t TestErr
 			objectName:         "test",
 			data:               []byte("Hello, World"),
 			expectedRespStatus: http.StatusBadRequest,
-			accessKey:          credentials.AccessKeyID,
-			secretKey:          credentials.SecretAccessKey,
+			accessKey:          credentials.AccessKey,
+			secretKey:          credentials.SecretKey,
 			malformedBody:      true,
 		},
 	}
@@ -229,8 +226,21 @@ func testPostPolicyBucketHandler(obj ObjectLayer, instanceType string, t TestErr
 		if rec.Code != testCase.expectedRespStatus {
 			t.Errorf("Test %d: %s: Expected the response status to be `%d`, but instead found `%d`", i+1, instanceType, testCase.expectedRespStatus, rec.Code)
 		}
+		// When the operation is successful, check if sending metadata is successful too
+		if rec.Code == http.StatusNoContent {
+			objInfo, err := obj.GetObjectInfo(context.Background(), bucketName, testCase.objectName+"/upload.txt", opts)
+			if err != nil {
+				t.Error("Unexpected error: ", err)
+			}
+			for k, v := range testCase.expectedHeaders {
+				if objInfo.UserDefined[k] != v {
+					t.Errorf("Expected to have header %s with value %s, but found value `%s` instead", k, v, objInfo.UserDefined[k])
+				}
+			}
+		}
 	}
 
+	region := "us-east-1"
 	// Test cases for signature-V4.
 	testCasesV4BadData := []struct {
 		objectName         string
@@ -248,20 +258,20 @@ func testPostPolicyBucketHandler(obj ObjectLayer, instanceType string, t TestErr
 			objectName:         "test",
 			data:               []byte("Hello, World"),
 			expectedRespStatus: http.StatusNoContent,
-			accessKey:          credentials.AccessKeyID,
-			secretKey:          credentials.SecretAccessKey,
+			accessKey:          credentials.AccessKey,
+			secretKey:          credentials.SecretKey,
 			dates:              []interface{}{curTimePlus5Min.Format(expirationDateFormat), curTime.Format(iso8601DateFormat), curTime.Format(yyyymmdd)},
-			policy:             `{"expiration": "%s","conditions":[["eq", "$bucket", "` + bucketName + `"], ["starts-with", "$key", "test/"], ["eq", "$x-amz-algorithm", "AWS4-HMAC-SHA256"], ["eq", "$x-amz-date", "%s"], ["eq", "$x-amz-credential", "` + credentials.AccessKeyID + `/%s/us-east-1/s3/aws4_request"]]}`,
+			policy:             `{"expiration": "%s","conditions":[["eq", "$bucket", "` + bucketName + `"], ["starts-with", "$key", "test/"], ["eq", "$x-amz-algorithm", "AWS4-HMAC-SHA256"], ["eq", "$x-amz-date", "%s"], ["eq", "$x-amz-credential", "` + credentials.AccessKey + `/%s/us-east-1/s3/aws4_request"]]}`,
 		},
 		// Corrupted Base 64 result
 		{
 			objectName:         "test",
 			data:               []byte("Hello, World"),
 			expectedRespStatus: http.StatusBadRequest,
-			accessKey:          credentials.AccessKeyID,
-			secretKey:          credentials.SecretAccessKey,
+			accessKey:          credentials.AccessKey,
+			secretKey:          credentials.SecretKey,
 			dates:              []interface{}{curTimePlus5Min.Format(expirationDateFormat), curTime.Format(iso8601DateFormat), curTime.Format(yyyymmdd)},
-			policy:             `{"expiration": "%s","conditions":[["eq", "$bucket", "` + bucketName + `"], ["starts-with", "$key", "test/"], ["eq", "$x-amz-algorithm", "AWS4-HMAC-SHA256"], ["eq", "$x-amz-date", "%s"], ["eq", "$x-amz-credential", "` + credentials.AccessKeyID + `/%s/us-east-1/s3/aws4_request"]]}`,
+			policy:             `{"expiration": "%s","conditions":[["eq", "$bucket", "` + bucketName + `"], ["starts-with", "$key", "test/"], ["eq", "$x-amz-algorithm", "AWS4-HMAC-SHA256"], ["eq", "$x-amz-date", "%s"], ["eq", "$x-amz-credential", "` + credentials.AccessKey + `/%s/us-east-1/s3/aws4_request"]]}`,
 			corruptedBase64:    true,
 		},
 		// Corrupted Multipart body
@@ -269,10 +279,10 @@ func testPostPolicyBucketHandler(obj ObjectLayer, instanceType string, t TestErr
 			objectName:         "test",
 			data:               []byte("Hello, World"),
 			expectedRespStatus: http.StatusBadRequest,
-			accessKey:          credentials.AccessKeyID,
-			secretKey:          credentials.SecretAccessKey,
+			accessKey:          credentials.AccessKey,
+			secretKey:          credentials.SecretKey,
 			dates:              []interface{}{curTimePlus5Min.Format(expirationDateFormat), curTime.Format(iso8601DateFormat), curTime.Format(yyyymmdd)},
-			policy:             `{"expiration": "%s","conditions":[["eq", "$bucket", "` + bucketName + `"], ["starts-with", "$key", "test/"], ["eq", "$x-amz-algorithm", "AWS4-HMAC-SHA256"], ["eq", "$x-amz-date", "%s"], ["eq", "$x-amz-credential", "` + credentials.AccessKeyID + `/%s/us-east-1/s3/aws4_request"]]}`,
+			policy:             `{"expiration": "%s","conditions":[["eq", "$bucket", "` + bucketName + `"], ["starts-with", "$key", "test/"], ["eq", "$x-amz-algorithm", "AWS4-HMAC-SHA256"], ["eq", "$x-amz-date", "%s"], ["eq", "$x-amz-credential", "` + credentials.AccessKey + `/%s/us-east-1/s3/aws4_request"]]}`,
 			corruptedMultipart: true,
 		},
 
@@ -291,18 +301,18 @@ func testPostPolicyBucketHandler(obj ObjectLayer, instanceType string, t TestErr
 			objectName:         "test",
 			data:               []byte("Hello, World"),
 			expectedRespStatus: http.StatusBadRequest,
-			accessKey:          credentials.AccessKeyID,
-			secretKey:          credentials.SecretAccessKey,
+			accessKey:          credentials.AccessKey,
+			secretKey:          credentials.SecretKey,
 			dates:              []interface{}{curTime.Add(-1 * time.Minute * 5).Format(expirationDateFormat), curTime.Format(iso8601DateFormat), curTime.Format(yyyymmdd)},
-			policy:             `{"expiration": "%s","conditions":[["eq", "$bucket", "` + bucketName + `"], ["starts-with", "$key", "test/"], ["eq", "$x-amz-algorithm", "AWS4-HMAC-SHA256"], ["eq", "$x-amz-date", "%s"], ["eq", "$x-amz-credential", "` + credentials.AccessKeyID + `/%s/us-east-1/s3/aws4_request"]]}`,
+			policy:             `{"expiration": "%s","conditions":[["eq", "$bucket", "` + bucketName + `"], ["starts-with", "$key", "test/"], ["eq", "$x-amz-algorithm", "AWS4-HMAC-SHA256"], ["eq", "$x-amz-date", "%s"], ["eq", "$x-amz-credential", "` + credentials.AccessKey + `/%s/us-east-1/s3/aws4_request"]]}`,
 		},
 		// Corrupted policy document
 		{
 			objectName:         "test",
 			data:               []byte("Hello, World"),
 			expectedRespStatus: http.StatusBadRequest,
-			accessKey:          credentials.AccessKeyID,
-			secretKey:          credentials.SecretAccessKey,
+			accessKey:          credentials.AccessKey,
+			secretKey:          credentials.SecretKey,
 			dates:              []interface{}{curTimePlus5Min.Format(expirationDateFormat), curTime.Format(iso8601DateFormat), curTime.Format(yyyymmdd)},
 			policy:             `{"3/aws4_request"]]}`,
 		},
@@ -312,10 +322,10 @@ func testPostPolicyBucketHandler(obj ObjectLayer, instanceType string, t TestErr
 		// initialize HTTP NewRecorder, this records any mutations to response writer inside the handler.
 		rec := httptest.NewRecorder()
 
-		// policy := buildGenericPolicy(curTime, testCase.accessKey, bucketName, testCase.objectName, false)
 		testCase.policy = fmt.Sprintf(testCase.policy, testCase.dates...)
+
 		req, perr := newPostRequestV4Generic("", bucketName, testCase.objectName, testCase.data, testCase.accessKey,
-			testCase.secretKey, curTime, []byte(testCase.policy), testCase.corruptedBase64, testCase.corruptedMultipart)
+			testCase.secretKey, region, curTime, []byte(testCase.policy), nil, testCase.corruptedBase64, testCase.corruptedMultipart)
 		if perr != nil {
 			t.Fatalf("Test %d: %s: Failed to create HTTP request for PostPolicyHandler: <ERROR> %v", i+1, instanceType, perr)
 		}
@@ -328,46 +338,66 @@ func testPostPolicyBucketHandler(obj ObjectLayer, instanceType string, t TestErr
 	}
 
 	testCases2 := []struct {
-		objectName         string
-		data               []byte
-		expectedRespStatus int
-		accessKey          string
-		secretKey          string
-		malformedBody      bool
+		objectName          string
+		data                []byte
+		expectedRespStatus  int
+		accessKey           string
+		secretKey           string
+		malformedBody       bool
+		ignoreContentLength bool
 	}{
 		// Success case.
 		{
-			objectName:         "test",
-			data:               bytes.Repeat([]byte("a"), 1025),
-			expectedRespStatus: http.StatusNoContent,
-			accessKey:          credentials.AccessKeyID,
-			secretKey:          credentials.SecretAccessKey,
-			malformedBody:      false,
+			objectName:          "test",
+			data:                bytes.Repeat([]byte("a"), 1025),
+			expectedRespStatus:  http.StatusNoContent,
+			accessKey:           credentials.AccessKey,
+			secretKey:           credentials.SecretKey,
+			malformedBody:       false,
+			ignoreContentLength: false,
+		},
+		// Failed with Content-Length not specified.
+		{
+			objectName:          "test",
+			data:                bytes.Repeat([]byte("a"), 1025),
+			expectedRespStatus:  http.StatusNoContent,
+			accessKey:           credentials.AccessKey,
+			secretKey:           credentials.SecretKey,
+			malformedBody:       false,
+			ignoreContentLength: true,
 		},
 		// Failed with entity too small.
 		{
-			objectName:         "test",
-			data:               bytes.Repeat([]byte("a"), 1023),
-			expectedRespStatus: http.StatusBadRequest,
-			accessKey:          credentials.AccessKeyID,
-			secretKey:          credentials.SecretAccessKey,
-			malformedBody:      false,
+			objectName:          "test",
+			data:                bytes.Repeat([]byte("a"), 1023),
+			expectedRespStatus:  http.StatusBadRequest,
+			accessKey:           credentials.AccessKey,
+			secretKey:           credentials.SecretKey,
+			malformedBody:       false,
+			ignoreContentLength: false,
 		},
 		// Failed with entity too large.
 		{
-			objectName:         "test",
-			data:               bytes.Repeat([]byte("a"), (1*humanize.MiByte)+1),
-			expectedRespStatus: http.StatusBadRequest,
-			accessKey:          credentials.AccessKeyID,
-			secretKey:          credentials.SecretAccessKey,
-			malformedBody:      false,
+			objectName:          "test",
+			data:                bytes.Repeat([]byte("a"), (1*humanize.MiByte)+1),
+			expectedRespStatus:  http.StatusBadRequest,
+			accessKey:           credentials.AccessKey,
+			secretKey:           credentials.SecretKey,
+			malformedBody:       false,
+			ignoreContentLength: false,
 		},
 	}
 
 	for i, testCase := range testCases2 {
 		// initialize HTTP NewRecorder, this records any mutations to response writer inside the handler.
 		rec := httptest.NewRecorder()
-		req, perr := newPostRequestV4WithContentLength("", bucketName, testCase.objectName, testCase.data, testCase.accessKey, testCase.secretKey)
+		var req *http.Request
+		var perr error
+		if testCase.ignoreContentLength {
+			req, perr = newPostRequestV4("", bucketName, testCase.objectName, testCase.data, testCase.accessKey, testCase.secretKey)
+		} else {
+			req, perr = newPostRequestV4WithContentLength("", bucketName, testCase.objectName, testCase.data, testCase.accessKey, testCase.secretKey)
+		}
 		if perr != nil {
 			t.Fatalf("Test %d: %s: Failed to create HTTP request for PostPolicyHandler: <ERROR> %v", i+1, instanceType, perr)
 		}
@@ -377,6 +407,91 @@ func testPostPolicyBucketHandler(obj ObjectLayer, instanceType string, t TestErr
 		if rec.Code != testCase.expectedRespStatus {
 			t.Errorf("Test %d: %s: Expected the response status to be `%d`, but instead found `%d`", i+1, instanceType, testCase.expectedRespStatus, rec.Code)
 		}
+	}
+
+}
+
+// Wrapper for calling TestPostPolicyBucketHandlerRedirect tests for both XL multiple disks and single node setup.
+func TestPostPolicyBucketHandlerRedirect(t *testing.T) {
+	ExecObjectLayerTest(t, testPostPolicyBucketHandlerRedirect)
+}
+
+// testPostPolicyBucketHandlerRedirect tests POST Object when success_action_redirect is specified
+func testPostPolicyBucketHandlerRedirect(obj ObjectLayer, instanceType string, t TestErrHandler) {
+	if err := newTestConfig(globalMinioDefaultRegion, obj); err != nil {
+		t.Fatalf("Initializing config.json failed")
+	}
+
+	// get random bucket name.
+	bucketName := getRandomBucketName()
+
+	// Key specified in Form data
+	keyName := "test/object"
+
+	var opts ObjectOptions
+
+	// The final name of the upload object
+	targetObj := keyName + "/upload.txt"
+
+	// The url of success_action_redirect field
+	redirectURL, err := url.Parse("http://www.google.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Register the API end points with XL/FS object layer.
+	apiRouter := initTestAPIEndPoints(obj, []string{"PostPolicy"})
+
+	credentials := globalServerConfig.GetCredential()
+
+	curTime := UTCNow()
+	curTimePlus5Min := curTime.Add(time.Minute * 5)
+
+	err = obj.MakeBucketWithLocation(context.Background(), bucketName, "")
+	if err != nil {
+		// Failed to create newbucket, abort.
+		t.Fatalf("%s : %s", instanceType, err.Error())
+	}
+
+	// initialize HTTP NewRecorder, this records any mutations to response writer inside the handler.
+	rec := httptest.NewRecorder()
+
+	dates := []interface{}{curTimePlus5Min.Format(expirationDateFormat), curTime.Format(iso8601DateFormat), curTime.Format(yyyymmdd)}
+	policy := `{"expiration": "%s","conditions":[["eq", "$bucket", "` + bucketName + `"], {"success_action_redirect":"` + redirectURL.String() + `"},["starts-with", "$key", "test/"], ["eq", "$x-amz-algorithm", "AWS4-HMAC-SHA256"], ["eq", "$x-amz-date", "%s"], ["eq", "$x-amz-credential", "` + credentials.AccessKey + `/%s/us-east-1/s3/aws4_request"]]}`
+
+	// Generate the final policy document
+	policy = fmt.Sprintf(policy, dates...)
+
+	region := "us-east-1"
+	// Create a new POST request with success_action_redirect field specified
+	req, perr := newPostRequestV4Generic("", bucketName, keyName, []byte("objData"),
+		credentials.AccessKey, credentials.SecretKey, region, curTime,
+		[]byte(policy), map[string]string{"success_action_redirect": redirectURL.String()}, false, false)
+
+	if perr != nil {
+		t.Fatalf("%s: Failed to create HTTP request for PostPolicyHandler: <ERROR> %v", instanceType, perr)
+	}
+	// Since `apiRouter` satisfies `http.Handler` it has a ServeHTTP to execute the logic ofthe handler.
+	// Call the ServeHTTP to execute the handler.
+	apiRouter.ServeHTTP(rec, req)
+
+	// Check the status code, which must be 303 because success_action_redirect is specified
+	if rec.Code != http.StatusSeeOther {
+		t.Errorf("%s: Expected the response status to be `%d`, but instead found `%d`", instanceType, http.StatusSeeOther, rec.Code)
+	}
+
+	// Get the uploaded object info
+	info, err := obj.GetObjectInfo(context.Background(), bucketName, targetObj, opts)
+	if err != nil {
+		t.Error("Unexpected error: ", err)
+	}
+
+	redirectURL.RawQuery = getRedirectPostRawQuery(info)
+	expectedLocation := redirectURL.String()
+
+	// Check the new location url
+	if rec.HeaderMap.Get("Location") != expectedLocation {
+		t.Errorf("Unexpected location, expected = %s, found = `%s`", rec.HeaderMap.Get("Location"), expectedLocation)
 	}
 
 }
@@ -392,7 +507,7 @@ func postPresignSignatureV4(policyBase64 string, t time.Time, secretAccessKey, l
 
 func newPostRequestV2(endPoint, bucketName, objectName string, accessKey, secretKey string) (*http.Request, error) {
 	// Expire the request five minutes from now.
-	expirationTime := time.Now().UTC().Add(time.Minute * 5)
+	expirationTime := UTCNow().Add(time.Minute * 5)
 	// Create a new post policy.
 	policy := newPostPolicyBytesV2(bucketName, objectName, expirationTime)
 	// Only need the encoding.
@@ -430,7 +545,7 @@ func newPostRequestV2(endPoint, bucketName, objectName string, accessKey, secret
 	// Set the body equal to the created policy.
 	reader := bytes.NewReader(buf.Bytes())
 
-	req, err := http.NewRequest("POST", makeTestTargetURL(endPoint, bucketName, objectName, nil), reader)
+	req, err := http.NewRequest("POST", makeTestTargetURL(endPoint, bucketName, "", nil), reader)
 	if err != nil {
 		return nil, err
 	}
@@ -440,11 +555,11 @@ func newPostRequestV2(endPoint, bucketName, objectName string, accessKey, secret
 	return req, nil
 }
 
-func buildGenericPolicy(t time.Time, accessKey, bucketName, objectName string, contentLengthRange bool) []byte {
+func buildGenericPolicy(t time.Time, accessKey, region, bucketName, objectName string, contentLengthRange bool) []byte {
 	// Expire the request five minutes from now.
 	expirationTime := t.Add(time.Minute * 5)
 
-	credStr := getCredential(accessKey, serverConfig.GetRegion(), t)
+	credStr := getCredentialString(accessKey, region, t)
 	// Create a new post policy.
 	policy := newPostPolicyBytesV4(credStr, bucketName, objectName, expirationTime)
 	if contentLengthRange {
@@ -453,9 +568,10 @@ func buildGenericPolicy(t time.Time, accessKey, bucketName, objectName string, c
 	return policy
 }
 
-func newPostRequestV4Generic(endPoint, bucketName, objectName string, objData []byte, accessKey, secretKey string, t time.Time, policy []byte, corruptedB64 bool, corruptedMultipart bool) (*http.Request, error) {
+func newPostRequestV4Generic(endPoint, bucketName, objectName string, objData []byte, accessKey, secretKey string, region string,
+	t time.Time, policy []byte, addFormData map[string]string, corruptedB64 bool, corruptedMultipart bool) (*http.Request, error) {
 	// Get the user credential.
-	credStr := getCredential(accessKey, serverConfig.GetRegion(), t)
+	credStr := getCredentialString(accessKey, region, t)
 
 	// Only need the encoding.
 	encodedPolicy := base64.StdEncoding.EncodeToString(policy)
@@ -465,7 +581,7 @@ func newPostRequestV4Generic(endPoint, bucketName, objectName string, objData []
 	}
 
 	// Presign with V4 signature based on the policy.
-	signature := postPresignSignatureV4(encodedPolicy, t, secretKey, serverConfig.GetRegion())
+	signature := postPresignSignatureV4(encodedPolicy, t, secretKey, region)
 
 	formData := map[string]string{
 		"bucket":           bucketName,
@@ -475,6 +591,13 @@ func newPostRequestV4Generic(endPoint, bucketName, objectName string, objData []
 		"x-amz-signature":  signature,
 		"x-amz-date":       t.Format(iso8601DateFormat),
 		"x-amz-algorithm":  "AWS4-HMAC-SHA256",
+		"x-amz-meta-uuid":  "1234",
+		"Content-Encoding": "gzip",
+	}
+
+	// Add form data
+	for k, v := range addFormData {
+		formData[k] = v
 	}
 
 	// Create the multipart form.
@@ -500,7 +623,7 @@ func newPostRequestV4Generic(endPoint, bucketName, objectName string, objData []
 	// Set the body equal to the created policy.
 	reader := bytes.NewReader(buf.Bytes())
 
-	req, err := http.NewRequest("POST", makeTestTargetURL(endPoint, bucketName, objectName, nil), reader)
+	req, err := http.NewRequest("POST", makeTestTargetURL(endPoint, bucketName, "", nil), reader)
 	if err != nil {
 		return nil, err
 	}
@@ -511,13 +634,15 @@ func newPostRequestV4Generic(endPoint, bucketName, objectName string, objData []
 }
 
 func newPostRequestV4WithContentLength(endPoint, bucketName, objectName string, objData []byte, accessKey, secretKey string) (*http.Request, error) {
-	t := time.Now().UTC()
-	policy := buildGenericPolicy(t, accessKey, bucketName, objectName, true)
-	return newPostRequestV4Generic(endPoint, bucketName, objectName, objData, accessKey, secretKey, t, policy, false, false)
+	t := UTCNow()
+	region := "us-east-1"
+	policy := buildGenericPolicy(t, accessKey, region, bucketName, objectName, true)
+	return newPostRequestV4Generic(endPoint, bucketName, objectName, objData, accessKey, secretKey, region, t, policy, nil, false, false)
 }
 
 func newPostRequestV4(endPoint, bucketName, objectName string, objData []byte, accessKey, secretKey string) (*http.Request, error) {
-	t := time.Now().UTC()
-	policy := buildGenericPolicy(t, accessKey, bucketName, objectName, false)
-	return newPostRequestV4Generic(endPoint, bucketName, objectName, objData, accessKey, secretKey, t, policy, false, false)
+	t := UTCNow()
+	region := "us-east-1"
+	policy := buildGenericPolicy(t, accessKey, region, bucketName, objectName, false)
+	return newPostRequestV4Generic(endPoint, bucketName, objectName, objData, accessKey, secretKey, region, t, policy, nil, false, false)
 }

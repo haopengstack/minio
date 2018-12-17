@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016 Minio, Inc.
+ * Minio Cloud Storage, (C) 2016, 2017, 2018 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,47 +17,87 @@
 package cmd
 
 import (
-	"net/rpc"
+	"path"
 
-	router "github.com/gorilla/mux"
+	"github.com/gorilla/mux"
+	"github.com/minio/minio/cmd/logger"
+	xrpc "github.com/minio/minio/cmd/rpc"
 )
 
-const servicePath = "/admin/service"
+const adminServiceName = "Admin"
+const adminServiceSubPath = "/admin"
 
-// serviceCmd - exports RPC methods for service status, stop and
-// restart commands.
-type serviceCmd struct {
-	loginServer
+var adminServicePath = path.Join(minioReservedBucketPath, adminServiceSubPath)
+
+// adminRPCReceiver - Admin RPC receiver for admin RPC server.
+type adminRPCReceiver struct {
+	local *localAdminClient
 }
 
-// Shutdown - Shutdown this instance of minio server.
-func (s *serviceCmd) Shutdown(args *GenericArgs, reply *GenericReply) error {
-	if !isRPCTokenValid(args.Token) {
-		return errInvalidToken
-	}
-	globalServiceSignalCh <- serviceStop
-	return nil
+// SignalServiceArgs - provides the signal argument to SignalService RPC
+type SignalServiceArgs struct {
+	AuthArgs
+	Sig serviceSignal
 }
 
-// Restart - Restart this instance of minio server.
-func (s *serviceCmd) Restart(args *GenericArgs, reply *GenericReply) error {
-	if !isRPCTokenValid(args.Token) {
-		return errInvalidToken
-	}
-	globalServiceSignalCh <- serviceRestart
-	return nil
+// SignalService - Send a restart or stop signal to the service
+func (receiver *adminRPCReceiver) SignalService(args *SignalServiceArgs, reply *VoidReply) error {
+	return receiver.local.SignalService(args.Sig)
 }
 
-// registerAdminRPCRouter - registers RPC methods for service status,
-// stop and restart commands.
-func registerAdminRPCRouter(mux *router.Router) error {
-	adminRPCHandler := &serviceCmd{}
-	adminRPCServer := rpc.NewServer()
-	err := adminRPCServer.RegisterName("Service", adminRPCHandler)
-	if err != nil {
-		return traceError(err)
+// ServerInfo - returns the server info when object layer was initialized on this server.
+func (receiver *adminRPCReceiver) ServerInfo(args *AuthArgs, reply *ServerInfoData) (err error) {
+	*reply, err = receiver.local.ServerInfo()
+	return err
+}
+
+// StartProfilingArgs - holds the RPC argument for StartingProfiling RPC call
+type StartProfilingArgs struct {
+	AuthArgs
+	Profiler string
+}
+
+// StartProfiling - starts profiling of this server
+func (receiver *adminRPCReceiver) StartProfiling(args *StartProfilingArgs, reply *VoidReply) error {
+	return receiver.local.StartProfiling(args.Profiler)
+}
+
+// DownloadProfilingData - stops and returns profiling data of this server
+func (receiver *adminRPCReceiver) DownloadProfilingData(args *AuthArgs, reply *[]byte) (err error) {
+	*reply, err = receiver.local.DownloadProfilingData()
+	return
+}
+
+// GetConfig - returns the config.json of this server.
+func (receiver *adminRPCReceiver) GetConfig(args *AuthArgs, reply *[]byte) (err error) {
+	*reply, err = receiver.local.GetConfig()
+	return err
+}
+
+// ReInitFormatArgs - provides dry-run information to re-initialize format.json
+type ReInitFormatArgs struct {
+	AuthArgs
+	DryRun bool
+}
+
+// ReInitFormat - re-init 'format.json'
+func (receiver *adminRPCReceiver) ReInitFormat(args *ReInitFormatArgs, reply *VoidReply) error {
+	return receiver.local.ReInitFormat(args.DryRun)
+}
+
+// NewAdminRPCServer - returns new admin RPC server.
+func NewAdminRPCServer() (*xrpc.Server, error) {
+	rpcServer := xrpc.NewServer()
+	if err := rpcServer.RegisterName(adminServiceName, &adminRPCReceiver{&localAdminClient{}}); err != nil {
+		return nil, err
 	}
-	adminRouter := mux.NewRoute().PathPrefix(reservedBucket).Subrouter()
-	adminRouter.Path(servicePath).Handler(adminRPCServer)
-	return nil
+	return rpcServer, nil
+}
+
+// registerAdminRPCRouter - creates and registers Admin RPC server and its router.
+func registerAdminRPCRouter(router *mux.Router) {
+	rpcServer, err := NewAdminRPCServer()
+	logger.FatalIf(err, "Unable to initialize Lock RPC Server")
+	subrouter := router.PathPrefix(minioReservedBucketPath).Subrouter()
+	subrouter.Path(adminServiceSubPath).HandlerFunc(httpTraceHdrs(rpcServer.ServeHTTP))
 }

@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016 Minio, Inc.
+ * Minio Cloud Storage, (C) 2016, 2017 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 package cmd
 
 import (
+	"os"
 	"reflect"
 	"testing"
 	"time"
@@ -25,22 +26,22 @@ import (
 // Test function to remove lock entries from map only in case they still exist based on name & uid combination
 func TestLockRpcServerRemoveEntryIfExists(t *testing.T) {
 	testPath, locker, _ := createLockTestServer(t)
-	defer removeAll(testPath)
+	defer os.RemoveAll(testPath)
 
 	lri := lockRequesterInfo{
-		writer:        false,
-		node:          "host",
-		rpcPath:       "rpc-path",
-		uid:           "0123-4567",
-		timestamp:     time.Now().UTC(),
-		timeLastCheck: time.Now().UTC(),
+		writer:          false,
+		node:            "host",
+		serviceEndpoint: "rpc-path",
+		uid:             "0123-4567",
+		timestamp:       UTCNow(),
+		timeLastCheck:   UTCNow(),
 	}
 	nlrip := nameLockRequesterInfoPair{name: "name", lri: lri}
 
 	// first test by simulating item has already been deleted
-	locker.removeEntryIfExists(nlrip)
+	locker.ll.removeEntryIfExists(nlrip)
 	{
-		gotLri, _ := locker.lockMap["name"]
+		gotLri, _ := locker.ll.lockMap["name"]
 		expectedLri := []lockRequesterInfo(nil)
 		if !reflect.DeepEqual(expectedLri, gotLri) {
 			t.Errorf("Expected %#v, got %#v", expectedLri, gotLri)
@@ -48,10 +49,10 @@ func TestLockRpcServerRemoveEntryIfExists(t *testing.T) {
 	}
 
 	// then test normal deletion
-	locker.lockMap["name"] = []lockRequesterInfo{lri} // add item
-	locker.removeEntryIfExists(nlrip)
+	locker.ll.lockMap["name"] = []lockRequesterInfo{lri} // add item
+	locker.ll.removeEntryIfExists(nlrip)
 	{
-		gotLri, _ := locker.lockMap["name"]
+		gotLri, _ := locker.ll.lockMap["name"]
 		expectedLri := []lockRequesterInfo(nil)
 		if !reflect.DeepEqual(expectedLri, gotLri) {
 			t.Errorf("Expected %#v, got %#v", expectedLri, gotLri)
@@ -62,51 +63,51 @@ func TestLockRpcServerRemoveEntryIfExists(t *testing.T) {
 // Test function to remove lock entries from map based on name & uid combination
 func TestLockRpcServerRemoveEntry(t *testing.T) {
 	testPath, locker, _ := createLockTestServer(t)
-	defer removeAll(testPath)
+	defer os.RemoveAll(testPath)
 
 	lockRequesterInfo1 := lockRequesterInfo{
-		writer:        true,
-		node:          "host",
-		rpcPath:       "rpc-path",
-		uid:           "0123-4567",
-		timestamp:     time.Now().UTC(),
-		timeLastCheck: time.Now().UTC(),
+		writer:          true,
+		node:            "host",
+		serviceEndpoint: "rpc-path",
+		uid:             "0123-4567",
+		timestamp:       UTCNow(),
+		timeLastCheck:   UTCNow(),
 	}
 	lockRequesterInfo2 := lockRequesterInfo{
-		writer:        true,
-		node:          "host",
-		rpcPath:       "rpc-path",
-		uid:           "89ab-cdef",
-		timestamp:     time.Now().UTC(),
-		timeLastCheck: time.Now().UTC(),
+		writer:          true,
+		node:            "host",
+		serviceEndpoint: "rpc-path",
+		uid:             "89ab-cdef",
+		timestamp:       UTCNow(),
+		timeLastCheck:   UTCNow(),
 	}
 
-	locker.lockMap["name"] = []lockRequesterInfo{
+	locker.ll.lockMap["name"] = []lockRequesterInfo{
 		lockRequesterInfo1,
 		lockRequesterInfo2,
 	}
 
-	lri, _ := locker.lockMap["name"]
+	lri, _ := locker.ll.lockMap["name"]
 
 	// test unknown uid
-	if locker.removeEntry("name", "unknown-uid", &lri) {
+	if locker.ll.removeEntry("name", "unknown-uid", &lri) {
 		t.Errorf("Expected %#v, got %#v", false, true)
 	}
 
-	if !locker.removeEntry("name", "0123-4567", &lri) {
+	if !locker.ll.removeEntry("name", "0123-4567", &lri) {
 		t.Errorf("Expected %#v, got %#v", true, false)
 	} else {
-		gotLri, _ := locker.lockMap["name"]
+		gotLri, _ := locker.ll.lockMap["name"]
 		expectedLri := []lockRequesterInfo{lockRequesterInfo2}
 		if !reflect.DeepEqual(expectedLri, gotLri) {
 			t.Errorf("Expected %#v, got %#v", expectedLri, gotLri)
 		}
 	}
 
-	if !locker.removeEntry("name", "89ab-cdef", &lri) {
+	if !locker.ll.removeEntry("name", "89ab-cdef", &lri) {
 		t.Errorf("Expected %#v, got %#v", true, false)
 	} else {
-		gotLri, _ := locker.lockMap["name"]
+		gotLri, _ := locker.ll.lockMap["name"]
 		expectedLri := []lockRequesterInfo(nil)
 		if !reflect.DeepEqual(expectedLri, gotLri) {
 			t.Errorf("Expected %#v, got %#v", expectedLri, gotLri)
@@ -116,7 +117,7 @@ func TestLockRpcServerRemoveEntry(t *testing.T) {
 
 // Tests function returning long lived locks.
 func TestLockRpcServerGetLongLivedLocks(t *testing.T) {
-	ut := time.Now().UTC()
+	ut := UTCNow()
 	// Collection of test cases for verifying returning valid long lived locks.
 	testCases := []struct {
 		lockMap      map[string][]lockRequesterInfo
@@ -127,12 +128,12 @@ func TestLockRpcServerGetLongLivedLocks(t *testing.T) {
 		{
 			lockMap: map[string][]lockRequesterInfo{
 				"test": {{
-					writer:        true,
-					node:          "10.1.10.21",
-					rpcPath:       "/lock/mnt/disk1",
-					uid:           "10000112",
-					timestamp:     ut,
-					timeLastCheck: ut,
+					writer:          true,
+					node:            "10.1.10.21",
+					serviceEndpoint: "/lock/mnt/disk1",
+					uid:             "10000112",
+					timestamp:       ut,
+					timeLastCheck:   ut,
 				}},
 			},
 			lockInterval: 1 * time.Minute,
@@ -142,12 +143,12 @@ func TestLockRpcServerGetLongLivedLocks(t *testing.T) {
 		{
 			lockMap: map[string][]lockRequesterInfo{
 				"test": {{
-					writer:        true,
-					node:          "10.1.10.21",
-					rpcPath:       "/lock/mnt/disk1",
-					uid:           "10000112",
-					timestamp:     ut,
-					timeLastCheck: ut.Add(-2 * time.Minute),
+					writer:          true,
+					node:            "10.1.10.21",
+					serviceEndpoint: "/lock/mnt/disk1",
+					uid:             "10000112",
+					timestamp:       ut,
+					timeLastCheck:   ut.Add(-2 * time.Minute),
 				}},
 			},
 			lockInterval: 1 * time.Minute,
@@ -155,12 +156,12 @@ func TestLockRpcServerGetLongLivedLocks(t *testing.T) {
 				{
 					name: "test",
 					lri: lockRequesterInfo{
-						writer:        true,
-						node:          "10.1.10.21",
-						rpcPath:       "/lock/mnt/disk1",
-						uid:           "10000112",
-						timestamp:     ut,
-						timeLastCheck: ut.Add(-2 * time.Minute),
+						writer:          true,
+						node:            "10.1.10.21",
+						serviceEndpoint: "/lock/mnt/disk1",
+						uid:             "10000112",
+						timestamp:       ut,
+						timeLastCheck:   ut.Add(-2 * time.Minute),
 					},
 				},
 			},

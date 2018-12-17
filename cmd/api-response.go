@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2015, 2016 Minio, Inc.
+ * Minio Cloud Storage, (C) 2015, 2016, 2017, 2018 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,12 +19,15 @@ package cmd
 import (
 	"encoding/xml"
 	"net/http"
+	"net/url"
 	"path"
+	"strings"
 	"time"
+
+	"github.com/minio/minio/pkg/handlers"
 )
 
 const (
-	timeFormatAMZ     = "2006-01-02T15:04:05Z"     // Reply date format
 	timeFormatAMZLong = "2006-01-02T15:04:05.000Z" // Reply date format with nanosecond precision.
 	maxObjectList     = 1000                       // Limit number of objects in a listObjectsResponse.
 	maxUploadsList    = 1000                       // Limit number of uploads in a listUploadsResponse.
@@ -205,6 +208,13 @@ type CopyObjectResponse struct {
 	ETag         string   // md5sum of the copied object.
 }
 
+// CopyObjectPartResponse container returns ETag and LastModified of the successfully copied object
+type CopyObjectPartResponse struct {
+	XMLName      xml.Name `xml:"http://s3.amazonaws.com/doc/2006-03-01/ CopyPartResult" json:"-"`
+	LastModified string   // time string of format "2006-01-02T15:04:05.000Z"
+	ETag         string   // md5sum of the copied object part.
+}
+
 // Initiator inherit from Owner struct, fields are same
 type Initiator Owner
 
@@ -251,14 +261,45 @@ type DeleteObjectsResponse struct {
 	Errors []DeleteError `xml:"Error,omitempty"`
 }
 
-// getLocation get URL location.
-func getLocation(r *http.Request) string {
-	return path.Clean(r.URL.Path) // Clean any trailing slashes.
+// PostResponse container for POST object request when success_action_status is set to 201
+type PostResponse struct {
+	Bucket   string
+	Key      string
+	ETag     string
+	Location string
 }
 
-// getObjectLocation gets the relative URL for an object
-func getObjectLocation(bucketName string, key string) string {
-	return "/" + bucketName + "/" + key
+// returns "https" if the tls boolean is true, "http" otherwise.
+func getURLScheme(tls bool) string {
+	if tls {
+		return httpsScheme
+	}
+	return httpScheme
+}
+
+// getObjectLocation gets the fully qualified URL of an object.
+func getObjectLocation(r *http.Request, domain, bucket, object string) string {
+	// unit tests do not have host set.
+	if r.Host == "" {
+		return path.Clean(r.URL.Path)
+	}
+	proto := handlers.GetSourceScheme(r)
+	if proto == "" {
+		proto = getURLScheme(globalIsSSL)
+	}
+	u := &url.URL{
+		Host:   r.Host,
+		Path:   path.Join(slashSeparator, bucket, object),
+		Scheme: proto,
+	}
+	// If domain is set then we need to use bucket DNS style.
+	if domain != "" {
+		if strings.Contains(r.Host, domain) {
+			u.Host = bucket + "." + r.Host
+			u.Path = path.Join(slashSeparator, object)
+		}
+	}
+	return u.String()
 }
 
 // generates ListBucketsResponse from array of BucketInfo which can be
@@ -268,13 +309,11 @@ func generateListBucketsResponse(buckets []BucketInfo) ListBucketsResponse {
 	var data = ListBucketsResponse{}
 	var owner = Owner{}
 
-	owner.ID = "minio"
-	owner.DisplayName = "minio"
-
+	owner.ID = globalMinioDefaultOwnerID
 	for _, bucket := range buckets {
 		var listbucket = Bucket{}
 		listbucket.Name = bucket.Name
-		listbucket.CreationDate = bucket.Created.Format(timeFormatAMZLong)
+		listbucket.CreationDate = bucket.Created.UTC().Format(timeFormatAMZLong)
 		listbuckets = append(listbuckets, listbucket)
 	}
 
@@ -291,9 +330,7 @@ func generateListObjectsV1Response(bucket, prefix, marker, delimiter string, max
 	var owner = Owner{}
 	var data = ListObjectsResponse{}
 
-	owner.ID = "minio"
-	owner.DisplayName = "minio"
-
+	owner.ID = globalMinioDefaultOwnerID
 	for _, object := range resp.Objects {
 		var content = Object{}
 		if object.Name == "" {
@@ -301,11 +338,11 @@ func generateListObjectsV1Response(bucket, prefix, marker, delimiter string, max
 		}
 		content.Key = object.Name
 		content.LastModified = object.ModTime.UTC().Format(timeFormatAMZLong)
-		if object.MD5Sum != "" {
-			content.ETag = "\"" + object.MD5Sum + "\""
+		if object.ETag != "" {
+			content.ETag = "\"" + object.ETag + "\""
 		}
 		content.Size = object.Size
-		content.StorageClass = "STANDARD"
+		content.StorageClass = object.StorageClass
 		content.Owner = owner
 		contents = append(contents, content)
 	}
@@ -330,29 +367,28 @@ func generateListObjectsV1Response(bucket, prefix, marker, delimiter string, max
 }
 
 // generates an ListObjectsV2 response for the said bucket with other enumerated options.
-func generateListObjectsV2Response(bucket, prefix, token, startAfter, delimiter string, fetchOwner bool, maxKeys int, resp ListObjectsInfo) ListObjectsV2Response {
+func generateListObjectsV2Response(bucket, prefix, token, nextToken, startAfter, delimiter string, fetchOwner, isTruncated bool, maxKeys int, objects []ObjectInfo, prefixes []string) ListObjectsV2Response {
 	var contents []Object
-	var prefixes []CommonPrefix
+	var commonPrefixes []CommonPrefix
 	var owner = Owner{}
 	var data = ListObjectsV2Response{}
 
 	if fetchOwner {
-		owner.ID = "minio"
-		owner.DisplayName = "minio"
+		owner.ID = globalMinioDefaultOwnerID
 	}
 
-	for _, object := range resp.Objects {
+	for _, object := range objects {
 		var content = Object{}
 		if object.Name == "" {
 			continue
 		}
 		content.Key = object.Name
 		content.LastModified = object.ModTime.UTC().Format(timeFormatAMZLong)
-		if object.MD5Sum != "" {
-			content.ETag = "\"" + object.MD5Sum + "\""
+		if object.ETag != "" {
+			content.ETag = "\"" + object.ETag + "\""
 		}
 		content.Size = object.Size
-		content.StorageClass = "STANDARD"
+		content.StorageClass = object.StorageClass
 		content.Owner = owner
 		contents = append(contents, content)
 	}
@@ -365,14 +401,14 @@ func generateListObjectsV2Response(bucket, prefix, token, startAfter, delimiter 
 	data.Prefix = prefix
 	data.MaxKeys = maxKeys
 	data.ContinuationToken = token
-	data.NextContinuationToken = resp.NextMarker
-	data.IsTruncated = resp.IsTruncated
-	for _, prefix := range resp.Prefixes {
+	data.NextContinuationToken = nextToken
+	data.IsTruncated = isTruncated
+	for _, prefix := range prefixes {
 		var prefixItem = CommonPrefix{}
 		prefixItem.Prefix = prefix
-		prefixes = append(prefixes, prefixItem)
+		commonPrefixes = append(commonPrefixes, prefixItem)
 	}
-	data.CommonPrefixes = prefixes
+	data.CommonPrefixes = commonPrefixes
 	data.KeyCount = len(data.Contents) + len(data.CommonPrefixes)
 	return data
 }
@@ -380,6 +416,14 @@ func generateListObjectsV2Response(bucket, prefix, token, startAfter, delimiter 
 // generates CopyObjectResponse from etag and lastModified time.
 func generateCopyObjectResponse(etag string, lastModified time.Time) CopyObjectResponse {
 	return CopyObjectResponse{
+		ETag:         "\"" + etag + "\"",
+		LastModified: lastModified.UTC().Format(timeFormatAMZLong),
+	}
+}
+
+// generates CopyObjectPartResponse from etag and lastModified time.
+func generateCopyObjectPartResponse(etag string, lastModified time.Time) CopyObjectPartResponse {
+	return CopyObjectPartResponse{
 		ETag:         "\"" + etag + "\"",
 		LastModified: lastModified.UTC().Format(timeFormatAMZLong),
 	}
@@ -411,11 +455,9 @@ func generateListPartsResponse(partsInfo ListPartsInfo) ListPartsResponse {
 	listPartsResponse.Bucket = partsInfo.Bucket
 	listPartsResponse.Key = partsInfo.Object
 	listPartsResponse.UploadID = partsInfo.UploadID
-	listPartsResponse.StorageClass = "STANDARD"
-	listPartsResponse.Initiator.ID = "minio"
-	listPartsResponse.Initiator.DisplayName = "minio"
-	listPartsResponse.Owner.ID = "minio"
-	listPartsResponse.Owner.DisplayName = "minio"
+	listPartsResponse.StorageClass = globalMinioDefaultStorageClass
+	listPartsResponse.Initiator.ID = globalMinioDefaultOwnerID
+	listPartsResponse.Owner.ID = globalMinioDefaultOwnerID
 
 	listPartsResponse.MaxParts = partsInfo.MaxParts
 	listPartsResponse.PartNumberMarker = partsInfo.PartNumberMarker
@@ -474,42 +516,110 @@ func generateMultiDeleteResponse(quiet bool, deletedObjects []ObjectIdentifier, 
 	return deleteResp
 }
 
-// writeSuccessResponse write success headers and response if any.
-func writeSuccessResponse(w http.ResponseWriter, response []byte) {
+func writeResponse(w http.ResponseWriter, statusCode int, response []byte, mType mimeType) {
 	setCommonHeaders(w)
-	if response == nil {
-		w.WriteHeader(http.StatusOK)
-		return
+	if mType != mimeNone {
+		w.Header().Set("Content-Type", string(mType))
 	}
-	w.Write(response)
-	w.(http.Flusher).Flush()
-}
-
-// writeSuccessNoContent write success headers with http status 204
-func writeSuccessNoContent(w http.ResponseWriter) {
-	setCommonHeaders(w)
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// writeErrorRespone write error headers
-func writeErrorResponse(w http.ResponseWriter, req *http.Request, errorCode APIErrorCode, resource string) {
-	apiError := getAPIError(errorCode)
-	// set common headers
-	setCommonHeaders(w)
-	// write Header
-	w.WriteHeader(apiError.HTTPStatusCode)
-	writeErrorResponseNoHeader(w, req, errorCode, resource)
-}
-
-func writeErrorResponseNoHeader(w http.ResponseWriter, req *http.Request, errorCode APIErrorCode, resource string) {
-	apiError := getAPIError(errorCode)
-	// Generate error response.
-	errorResponse := getAPIErrorResponse(apiError, resource)
-	encodedErrorResponse := encodeResponse(errorResponse)
-	// HEAD should have no body, do not attempt to write to it
-	if req.Method != "HEAD" {
-		// write error body
-		w.Write(encodedErrorResponse)
+	w.WriteHeader(statusCode)
+	if response != nil {
+		w.Write(response)
 		w.(http.Flusher).Flush()
 	}
+}
+
+// mimeType represents various MIME type used API responses.
+type mimeType string
+
+const (
+	// Means no response type.
+	mimeNone mimeType = ""
+	// Means response type is JSON.
+	mimeJSON mimeType = "application/json"
+	// Means response type is XML.
+	mimeXML mimeType = "application/xml"
+)
+
+// writeSuccessResponseJSON writes success headers and response if any,
+// with content-type set to `application/json`.
+func writeSuccessResponseJSON(w http.ResponseWriter, response []byte) {
+	writeResponse(w, http.StatusOK, response, mimeJSON)
+}
+
+// writeSuccessResponseXML writes success headers and response if any,
+// with content-type set to `application/xml`.
+func writeSuccessResponseXML(w http.ResponseWriter, response []byte) {
+	writeResponse(w, http.StatusOK, response, mimeXML)
+}
+
+// writeSuccessNoContent writes success headers with http status 204
+func writeSuccessNoContent(w http.ResponseWriter) {
+	writeResponse(w, http.StatusNoContent, nil, mimeNone)
+}
+
+// writeRedirectSeeOther writes Location header with http status 303
+func writeRedirectSeeOther(w http.ResponseWriter, location string) {
+	w.Header().Set("Location", location)
+	writeResponse(w, http.StatusSeeOther, nil, mimeNone)
+}
+
+func writeSuccessResponseHeadersOnly(w http.ResponseWriter) {
+	writeResponse(w, http.StatusOK, nil, mimeNone)
+}
+
+// writeErrorRespone writes error headers
+func writeErrorResponse(w http.ResponseWriter, errorCode APIErrorCode, reqURL *url.URL, browser bool) {
+	switch errorCode {
+	case ErrSlowDown, ErrServerNotInitialized, ErrReadQuorum, ErrWriteQuorum:
+		// Set retry-after header to indicate user-agents to retry request after 120secs.
+		// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Retry-After
+		w.Header().Set("Retry-After", "120")
+	case ErrAccessDenied:
+		// The request is from browser and also if browser
+		// is enabled we need to redirect.
+		if browser && globalIsBrowserEnabled {
+			w.Header().Set("Location", minioReservedBucketPath+reqURL.Path)
+			w.WriteHeader(http.StatusTemporaryRedirect)
+			return
+		}
+	}
+
+	apiError := getAPIError(errorCode)
+	// Generate error response.
+	errorResponse := getAPIErrorResponse(apiError, reqURL.Path, w.Header().Get(responseRequestIDKey))
+	encodedErrorResponse := encodeResponse(errorResponse)
+	writeResponse(w, apiError.HTTPStatusCode, encodedErrorResponse, mimeXML)
+}
+
+func writeErrorResponseHeadersOnly(w http.ResponseWriter, errorCode APIErrorCode) {
+	apiError := getAPIError(errorCode)
+	writeResponse(w, apiError.HTTPStatusCode, nil, mimeNone)
+}
+
+// writeErrorResponseJSON - writes error response in JSON format;
+// useful for admin APIs.
+func writeErrorResponseJSON(w http.ResponseWriter, errorCode APIErrorCode, reqURL *url.URL) {
+	apiError := getAPIError(errorCode)
+	// Generate error response.
+	errorResponse := getAPIErrorResponse(apiError, reqURL.Path, w.Header().Get(responseRequestIDKey))
+	encodedErrorResponse := encodeResponseJSON(errorResponse)
+	writeResponse(w, apiError.HTTPStatusCode, encodedErrorResponse, mimeJSON)
+}
+
+// writeCustomErrorResponseJSON - similar to writeErrorResponseJSON,
+// but accepts the error message directly (this allows messages to be
+// dynamically generated.)
+func writeCustomErrorResponseJSON(w http.ResponseWriter, errorCode APIErrorCode,
+	errBody string, reqURL *url.URL) {
+
+	apiError := getAPIError(errorCode)
+	errorResponse := APIErrorResponse{
+		Code:      apiError.Code,
+		Message:   errBody,
+		Resource:  reqURL.Path,
+		RequestID: w.Header().Get(responseRequestIDKey),
+		HostID:    "3L137",
+	}
+	encodedErrorResponse := encodeResponseJSON(errorResponse)
+	writeResponse(w, apiError.HTTPStatusCode, encodedErrorResponse, mimeJSON)
 }

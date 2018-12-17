@@ -2,9 +2,17 @@
 package gjson
 
 import (
+	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"reflect"
 	"strconv"
-	"unsafe"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/tidwall/match"
 )
@@ -27,6 +35,26 @@ const (
 	JSON
 )
 
+// String returns a string representation of the type.
+func (t Type) String() string {
+	switch t {
+	default:
+		return ""
+	case Null:
+		return "Null"
+	case False:
+		return "False"
+	case Number:
+		return "Number"
+	case String:
+		return "String"
+	case True:
+		return "True"
+	case JSON:
+		return "JSON"
+	}
+}
+
 // Result represents a json value that is returned from Get().
 type Result struct {
 	// Type is the json type
@@ -37,17 +65,32 @@ type Result struct {
 	Str string
 	// Num is the json number
 	Num float64
+	// Index of raw value in original json, zero means index unknown
+	Index int
 }
 
 // String returns a string representation of the value.
 func (t Result) String() string {
 	switch t.Type {
 	default:
-		return "null"
+		return ""
 	case False:
 		return "false"
 	case Number:
-		return strconv.FormatFloat(t.Num, 'f', -1, 64)
+		if len(t.Raw) == 0 {
+			// calculated result
+			return strconv.FormatFloat(t.Num, 'f', -1, 64)
+		}
+		var i int
+		if t.Raw[0] == '-' {
+			i++
+		}
+		for ; i < len(t.Raw); i++ {
+			if t.Raw[i] < '0' || t.Raw[i] > '9' {
+				return strconv.FormatFloat(t.Num, 'f', -1, 64)
+			}
+		}
+		return t.Raw
 	case String:
 		return t.Str
 	case JSON:
@@ -65,7 +108,7 @@ func (t Result) Bool() bool {
 	case True:
 		return true
 	case String:
-		return t.Str != "" && t.Str != "0"
+		return t.Str != "" && t.Str != "0" && t.Str != "false"
 	case Number:
 		return t.Num != 0
 	}
@@ -79,10 +122,45 @@ func (t Result) Int() int64 {
 	case True:
 		return 1
 	case String:
-		n, _ := strconv.ParseInt(t.Str, 10, 64)
+		n, _ := parseInt(t.Str)
 		return n
 	case Number:
-		return int64(t.Num)
+		// try to directly convert the float64 to int64
+		n, ok := floatToInt(t.Num)
+		if !ok {
+			// now try to parse the raw string
+			n, ok = parseInt(t.Raw)
+			if !ok {
+				// fallback to a standard conversion
+				return int64(t.Num)
+			}
+		}
+		return n
+	}
+}
+
+// Uint returns an unsigned integer representation.
+func (t Result) Uint() uint64 {
+	switch t.Type {
+	default:
+		return 0
+	case True:
+		return 1
+	case String:
+		n, _ := parseUint(t.Str)
+		return n
+	case Number:
+		// try to directly convert the float64 to uint64
+		n, ok := floatToUint(t.Num)
+		if !ok {
+			// now try to parse the raw string
+			n, ok = parseUint(t.Raw)
+			if !ok {
+				// fallback to a standard conversion
+				return uint64(t.Num)
+			}
+		}
+		return n
 	}
 }
 
@@ -101,16 +179,107 @@ func (t Result) Float() float64 {
 	}
 }
 
-// Array returns back an array of children. The result must be a JSON array.
+// Time returns a time.Time representation.
+func (t Result) Time() time.Time {
+	res, _ := time.Parse(time.RFC3339, t.String())
+	return res
+}
+
+// Array returns back an array of values.
+// If the result represents a non-existent value, then an empty array will be returned.
+// If the result is not a JSON array, the return value will be an array containing one result.
 func (t Result) Array() []Result {
+	if t.Type == Null {
+		return []Result{}
+	}
 	if t.Type != JSON {
-		return nil
+		return []Result{t}
 	}
 	r := t.arrayOrMap('[', false)
 	return r.a
 }
 
-//  Map returns back an map of children. The result should be a JSON array.
+// IsObject returns true if the result value is a JSON object.
+func (t Result) IsObject() bool {
+	return t.Type == JSON && len(t.Raw) > 0 && t.Raw[0] == '{'
+}
+
+// IsArray returns true if the result value is a JSON array.
+func (t Result) IsArray() bool {
+	return t.Type == JSON && len(t.Raw) > 0 && t.Raw[0] == '['
+}
+
+// ForEach iterates through values.
+// If the result represents a non-existent value, then no values will be iterated.
+// If the result is an Object, the iterator will pass the key and value of each item.
+// If the result is an Array, the iterator will only pass the value of each item.
+// If the result is not a JSON array or object, the iterator will pass back one value equal to the result.
+func (t Result) ForEach(iterator func(key, value Result) bool) {
+	if !t.Exists() {
+		return
+	}
+	if t.Type != JSON {
+		iterator(Result{}, t)
+		return
+	}
+	json := t.Raw
+	var keys bool
+	var i int
+	var key, value Result
+	for ; i < len(json); i++ {
+		if json[i] == '{' {
+			i++
+			key.Type = String
+			keys = true
+			break
+		} else if json[i] == '[' {
+			i++
+			break
+		}
+		if json[i] > ' ' {
+			return
+		}
+	}
+	var str string
+	var vesc bool
+	var ok bool
+	for ; i < len(json); i++ {
+		if keys {
+			if json[i] != '"' {
+				continue
+			}
+			s := i
+			i, str, vesc, ok = parseString(json, i+1)
+			if !ok {
+				return
+			}
+			if vesc {
+				key.Str = unescape(str[1 : len(str)-1])
+			} else {
+				key.Str = str[1 : len(str)-1]
+			}
+			key.Raw = str
+			key.Index = s
+		}
+		for ; i < len(json); i++ {
+			if json[i] <= ' ' || json[i] == ',' || json[i] == ':' {
+				continue
+			}
+			break
+		}
+		s := i
+		i, value, ok = parseAny(json, i, true)
+		if !ok {
+			return
+		}
+		value.Index = s
+		if !iterator(key, value) {
+			return
+		}
+	}
+}
+
+// Map returns back an map of values. The result should be a JSON array.
 func (t Result) Map() map[string]Result {
 	if t.Type != JSON {
 		return map[string]Result{}
@@ -188,24 +357,30 @@ func (t Result) arrayOrMap(vc byte, valueize bool) (r arrayOrMapResult) {
 			if (json[i] >= '0' && json[i] <= '9') || json[i] == '-' {
 				value.Type = Number
 				value.Raw, value.Num = tonum(json[i:])
+				value.Str = ""
 			} else {
 				continue
 			}
 		case '{', '[':
 			value.Type = JSON
 			value.Raw = squash(json[i:])
+			value.Str, value.Num = "", 0
 		case 'n':
 			value.Type = Null
 			value.Raw = tolit(json[i:])
+			value.Str, value.Num = "", 0
 		case 't':
 			value.Type = True
 			value.Raw = tolit(json[i:])
+			value.Str, value.Num = "", 0
 		case 'f':
 			value.Type = False
 			value.Raw = tolit(json[i:])
+			value.Str, value.Num = "", 0
 		case '"':
 			value.Type = String
 			value.Raw, value.Str = tostr(json[i:])
+			value.Num = 0
 		}
 		i += len(value.Raw) - 1
 
@@ -214,9 +389,13 @@ func (t Result) arrayOrMap(vc byte, valueize bool) (r arrayOrMapResult) {
 				key = value
 			} else {
 				if valueize {
-					r.oi[key.Str] = value.Value()
+					if _, ok := r.oi[key.Str]; !ok {
+						r.oi[key.Str] = value.Value()
+					}
 				} else {
-					r.o[key.Str] = value
+					if _, ok := r.o[key.Str]; !ok {
+						r.o[key.Str] = value
+					}
 				}
 			}
 			count++
@@ -232,7 +411,12 @@ end:
 	return
 }
 
-// Parse parses the json and returns a result
+// Parse parses the json and returns a result.
+//
+// This function expects that the json is well-formed, and does not validate.
+// Invalid json will not panic, but it may return back unexpected results.
+// If you are consuming JSON from an unpredictable source then you may want to
+// use the Valid function first.
 func Parse(json string) Result {
 	var value Result
 	for i := 0; i < len(json); i++ {
@@ -268,6 +452,12 @@ func Parse(json string) Result {
 		break
 	}
 	return value
+}
+
+// ParseBytes parses the json and returns a result.
+// If working with bytes, this method preferred over Parse(string(data))
+func ParseBytes(json []byte) Result {
+	return Parse(string(json))
 }
 
 func squash(json string) string {
@@ -348,7 +538,7 @@ func tonum(json string) (raw string, num float64) {
 
 func tolit(json string) (raw string) {
 	for i := 1; i < len(json); i++ {
-		if json[i] <= 'a' || json[i] >= 'z' {
+		if json[i] < 'a' || json[i] > 'z' {
 			return json[:i]
 		}
 	}
@@ -387,7 +577,13 @@ func tostr(json string) (raw string, str string) {
 					break
 				}
 			}
-			return json[:i+1], unescape(json[1:i])
+			var ret string
+			if i+1 < len(json) {
+				ret = json[:i+1]
+			} else {
+				ret = json[:i]
+			}
+			return ret, unescape(json[1:i])
 		}
 	}
 	return json, json[1:]
@@ -409,6 +605,8 @@ func (t Result) Exists() bool {
 //	Number, for JSON numbers
 //	string, for JSON string literals
 //	nil, for JSON null
+//	map[string]interface{}, for JSON objects
+//	[]interface{}, for JSON arrays
 //
 func (t Result) Value() interface{} {
 	if t.Type == String {
@@ -506,6 +704,7 @@ type arrayPathResult struct {
 		path  string
 		op    string
 		value string
+		all   bool
 	}
 }
 
@@ -536,8 +735,12 @@ func parseArrayPath(path string) (r arrayPathResult) {
 					}
 					s := i
 					for ; i < len(path); i++ {
-						if path[i] <= ' ' || path[i] == '=' ||
-							path[i] == '<' || path[i] == '>' ||
+						if path[i] <= ' ' ||
+							path[i] == '!' ||
+							path[i] == '=' ||
+							path[i] == '<' ||
+							path[i] == '>' ||
+							path[i] == '%' ||
 							path[i] == ']' {
 							break
 						}
@@ -551,7 +754,11 @@ func parseArrayPath(path string) (r arrayPathResult) {
 					}
 					if i < len(path) {
 						s = i
-						if path[i] == '<' || path[i] == '>' {
+						if path[i] == '!' {
+							if i < len(path)-1 && (path[i+1] == '=' || path[i+1] == '%') {
+								i++
+							}
+						} else if path[i] == '<' || path[i] == '>' {
 							if i < len(path)-1 && path[i+1] == '=' {
 								i++
 							}
@@ -596,6 +803,9 @@ func parseArrayPath(path string) (r arrayPathResult) {
 									}
 								}
 							} else if path[i] == ']' {
+								if i+1 < len(path) && path[i+1] == '#' {
+									r.query.all = true
+								}
 								break
 							}
 						}
@@ -767,7 +977,7 @@ func parseObject(c *parseContext, i int, path string) (int, bool) {
 						break
 					}
 				}
-				i, key, kesc, ok = i, c.json[s:], false, false
+				key, kesc, ok = c.json[s:], false, false
 			parse_key_string_done:
 				break
 			}
@@ -877,6 +1087,8 @@ func queryMatches(rp *arrayPathResult, value Result) bool {
 		switch rp.query.op {
 		case "=":
 			return value.Str == rpv
+		case "!=":
+			return value.Str != rpv
 		case "<":
 			return value.Str < rpv
 		case "<=":
@@ -885,12 +1097,18 @@ func queryMatches(rp *arrayPathResult, value Result) bool {
 			return value.Str > rpv
 		case ">=":
 			return value.Str >= rpv
+		case "%":
+			return match.Match(value.Str, rpv)
+		case "!%":
+			return !match.Match(value.Str, rpv)
 		}
 	case Number:
 		rpvn, _ := strconv.ParseFloat(rpv, 64)
 		switch rp.query.op {
 		case "=":
 			return value.Num == rpvn
+		case "!=":
+			return value.Num != rpvn
 		case "<":
 			return value.Num < rpvn
 		case "<=":
@@ -904,6 +1122,8 @@ func queryMatches(rp *arrayPathResult, value Result) bool {
 		switch rp.query.op {
 		case "=":
 			return rpv == "true"
+		case "!=":
+			return rpv != "true"
 		case ">":
 			return rpv == "false"
 		case ">=":
@@ -913,6 +1133,8 @@ func queryMatches(rp *arrayPathResult, value Result) bool {
 		switch rp.query.op {
 		case "=":
 			return rpv == "false"
+		case "!=":
+			return rpv != "false"
 		case "<":
 			return rpv == "true"
 		case "<=":
@@ -927,16 +1149,17 @@ func parseArray(c *parseContext, i int, path string) (int, bool) {
 	var h int
 	var alog []int
 	var partidx int
+	var multires []byte
 	rp := parseArrayPath(path)
 	if !rp.arrch {
-		n, err := strconv.ParseUint(rp.part, 10, 64)
-		if err != nil {
+		n, ok := parseUint(rp.part)
+		if !ok {
 			partidx = -1
 		} else {
 			partidx = int(n)
 		}
 	}
-	for i < len(c.json) {
+	for i < len(c.json)+1 {
 		if !rp.arrch {
 			pmatch = partidx == h
 			hit = pmatch && !rp.more
@@ -945,8 +1168,16 @@ func parseArray(c *parseContext, i int, path string) (int, bool) {
 		if rp.alogok {
 			alog = append(alog, i)
 		}
-		for ; i < len(c.json); i++ {
-			switch c.json[i] {
+		for ; ; i++ {
+			var ch byte
+			if i > len(c.json) {
+				break
+			} else if i == len(c.json) {
+				ch = ']'
+			} else {
+				ch = c.json[i]
+			}
+			switch ch {
 			default:
 				continue
 			case '"':
@@ -983,12 +1214,21 @@ func parseArray(c *parseContext, i int, path string) (int, bool) {
 						res := Get(val, rp.query.path)
 						if queryMatches(&rp, res) {
 							if rp.more {
-								c.value = Get(val, rp.path)
+								res = Get(val, rp.path)
 							} else {
-								c.value.Raw = val
-								c.value.Type = JSON
+								res = Result{Raw: val, Type: JSON}
 							}
-							return i, true
+							if rp.query.all {
+								if len(multires) == 0 {
+									multires = append(multires, '[')
+								} else {
+									multires = append(multires, ',')
+								}
+								multires = append(multires, res.Raw...)
+							} else {
+								c.value = res
+								return i, true
+							}
 						}
 					} else if hit {
 						if rp.alogok {
@@ -1051,27 +1291,38 @@ func parseArray(c *parseContext, i int, path string) (int, bool) {
 					if rp.alogok {
 						var jsons = make([]byte, 0, 64)
 						jsons = append(jsons, '[')
-						for j := 0; j < len(alog); j++ {
-							res := Get(c.json[alog[j]:], rp.alogkey)
-							if res.Exists() {
-								if j > 0 {
-									jsons = append(jsons, ',')
+
+						for j, k := 0, 0; j < len(alog); j++ {
+							_, res, ok := parseAny(c.json, alog[j], true)
+							if ok {
+								res := res.Get(rp.alogkey)
+								if res.Exists() {
+									if k > 0 {
+										jsons = append(jsons, ',')
+									}
+									jsons = append(jsons, []byte(res.Raw)...)
+									k++
 								}
-								jsons = append(jsons, []byte(res.Raw)...)
 							}
 						}
 						jsons = append(jsons, ']')
 						c.value.Type = JSON
 						c.value.Raw = string(jsons)
 						return i + 1, true
-					} else {
-						if rp.alogok {
-							break
-						}
-						c.value.Raw = val
-						c.value.Type = Number
-						c.value.Num = float64(h - 1)
-						return i + 1, true
+					}
+					if rp.alogok {
+						break
+					}
+					c.value.Raw = ""
+					c.value.Type = Number
+					c.value.Num = float64(h - 1)
+					c.calcd = true
+					return i + 1, true
+				}
+				if len(multires) > 0 && !c.value.Exists() {
+					c.value = Result{
+						Raw:  string(append(multires, ']')),
+						Type: JSON,
 					}
 				}
 				return i + 1, false
@@ -1082,18 +1333,35 @@ func parseArray(c *parseContext, i int, path string) (int, bool) {
 	return i, false
 }
 
+// ForEachLine iterates through lines of JSON as specified by the JSON Lines
+// format (http://jsonlines.org/).
+// Each line is returned as a GJSON Result.
+func ForEachLine(json string, iterator func(line Result) bool) {
+	var res Result
+	var i int
+	for {
+		i, res, _ = parseAny(json, i, true)
+		if !res.Exists() {
+			break
+		}
+		if !iterator(res) {
+			return
+		}
+	}
+}
+
 type parseContext struct {
 	json  string
 	value Result
+	calcd bool
+	lines bool
 }
 
 // Get searches json for the specified path.
 // A path is in dot syntax, such as "name.last" or "age".
-// This function expects that the json is well-formed, and does not validate.
-// Invalid json will not panic, but it may return back unexpected results.
 // When the value is found it's returned immediately.
 //
-// A path is a series of keys seperated by a dot.
+// A path is a series of keys searated by a dot.
 // A key may contain special wildcard characters '*' and '?'.
 // To access an array value use the index as the key.
 // To get the number of elements in an array or to access a child path, use the '#' character.
@@ -1110,62 +1378,51 @@ type parseContext struct {
 //  }
 //  "name.last"          >> "Anderson"
 //  "age"                >> 37
+//  "children"           >> ["Sara","Alex","Jack"]
 //  "children.#"         >> 3
 //  "children.1"         >> "Alex"
 //  "child*.2"           >> "Jack"
 //  "c?ildren.0"         >> "Sara"
-//  "friends.#.first"    >> [ "James", "Roger" ]
+//  "friends.#.first"    >> ["James","Roger"]
 //
+// This function expects that the json is well-formed, and does not validate.
+// Invalid json will not panic, but it may return back unexpected results.
+// If you are consuming JSON from an unpredictable source then you may want to
+// use the Valid function first.
 func Get(json, path string) Result {
 	var i int
 	var c = &parseContext{json: json}
-	for ; i < len(c.json); i++ {
-		if c.json[i] == '{' {
-			i++
-			parseObject(c, i, path)
-			break
-		}
-		if c.json[i] == '[' {
-			i++
-			parseArray(c, i, path)
-			break
+	if len(path) >= 2 && path[0] == '.' && path[1] == '.' {
+		c.lines = true
+		parseArray(c, 0, path[2:])
+	} else {
+		for ; i < len(c.json); i++ {
+			if c.json[i] == '{' {
+				i++
+				parseObject(c, i, path)
+				break
+			}
+			if c.json[i] == '[' {
+				i++
+				parseArray(c, i, path)
+				break
+			}
 		}
 	}
+	fillIndex(json, c)
 	return c.value
 }
 
 // GetBytes searches json for the specified path.
 // If working with bytes, this method preferred over Get(string(data), path)
 func GetBytes(json []byte, path string) Result {
-	var result Result
-	if json != nil {
-		// unsafe cast to string
-		result = Get(*(*string)(unsafe.Pointer(&json)), path)
-		// copy of string data for safety.
-		rawh := *(*reflect.SliceHeader)(unsafe.Pointer(&result.Raw))
-		strh := *(*reflect.SliceHeader)(unsafe.Pointer(&result.Str))
-		if strh.Data == 0 {
-			if rawh.Data == 0 {
-				result.Raw = ""
-			} else {
-				result.Raw = string(*(*[]byte)(unsafe.Pointer(&result.Raw)))
-			}
-			result.Str = ""
-		} else if rawh.Data == 0 {
-			result.Raw = ""
-			result.Str = string(*(*[]byte)(unsafe.Pointer(&result.Str)))
-		} else if strh.Data >= rawh.Data &&
-			int(strh.Data)+strh.Len <= int(rawh.Data)+rawh.Len {
-			// Str is a substring of Raw.
-			start := int(strh.Data - rawh.Data)
-			result.Raw = string(*(*[]byte)(unsafe.Pointer(&result.Raw)))
-			result.Str = result.Raw[start : start+strh.Len]
-		} else {
-			result.Raw = string(*(*[]byte)(unsafe.Pointer(&result.Raw)))
-			result.Str = string(*(*[]byte)(unsafe.Pointer(&result.Str)))
-		}
-	}
-	return result
+	return getBytes(json, path)
+}
+
+// runeit returns the rune from the the \uXXXX
+func runeit(json string) rune {
+	n, _ := strconv.ParseUint(json[:4], 16, 64)
+	return rune(n)
 }
 
 // unescape unescapes a string
@@ -1176,15 +1433,15 @@ func unescape(json string) string { //, error) {
 		default:
 			str = append(str, json[i])
 		case json[i] < ' ':
-			return "" //, errors.New("invalid character in string")
+			return string(str)
 		case json[i] == '\\':
 			i++
 			if i >= len(json) {
-				return "" //, errors.New("invalid escape sequence")
+				return string(str)
 			}
 			switch json[i] {
 			default:
-				return "" //, errors.New("invalid escape sequence")
+				return string(str)
 			case '\\':
 				str = append(str, '\\')
 			case '/':
@@ -1203,29 +1460,27 @@ func unescape(json string) string { //, error) {
 				str = append(str, '"')
 			case 'u':
 				if i+5 > len(json) {
-					return "" //, errors.New("invalid escape sequence")
+					return string(str)
 				}
-				i++
-				// extract the codepoint
-				var code int
-				for j := i; j < i+4; j++ {
-					switch {
-					default:
-						return "" //, errors.New("invalid escape sequence")
-					case json[j] >= '0' && json[j] <= '9':
-						code += (int(json[j]) - '0') << uint(12-(j-i)*4)
-					case json[j] >= 'a' && json[j] <= 'f':
-						code += (int(json[j]) - 'a' + 10) << uint(12-(j-i)*4)
-					case json[j] >= 'a' && json[j] <= 'f':
-						code += (int(json[j]) - 'a' + 10) << uint(12-(j-i)*4)
+				r := runeit(json[i+1:])
+				i += 5
+				if utf16.IsSurrogate(r) {
+					// need another code
+					if len(json[i:]) >= 6 && json[i] == '\\' && json[i+1] == 'u' {
+						// we expect it to be correct so just consume it
+						r = utf16.DecodeRune(r, runeit(json[i+2:]))
+						i += 6
 					}
 				}
-				str = append(str, []byte(string(code))...)
-				i += 3 // only 3 because we will increment on the for-loop
+				// provide enough space to encode the largest utf8 possible
+				str = append(str, 0, 0, 0, 0, 0, 0, 0, 0)
+				n := utf8.EncodeRune(str[len(str)-8:], r)
+				str = str[:len(str)-8+n]
+				i-- // backtrack index by one
 			}
 		}
 	}
-	return string(str) //, nil
+	return string(str)
 }
 
 // Less return true if a token is less than another token.
@@ -1288,4 +1543,574 @@ func stringLessInsensitive(a, b string) bool {
 		}
 	}
 	return len(a) < len(b)
+}
+
+// parseAny parses the next value from a json string.
+// A Result is returned when the hit param is set.
+// The return values are (i int, res Result, ok bool)
+func parseAny(json string, i int, hit bool) (int, Result, bool) {
+	var res Result
+	var val string
+	for ; i < len(json); i++ {
+		if json[i] == '{' || json[i] == '[' {
+			i, val = parseSquash(json, i)
+			if hit {
+				res.Raw = val
+				res.Type = JSON
+			}
+			return i, res, true
+		}
+		if json[i] <= ' ' {
+			continue
+		}
+		switch json[i] {
+		case '"':
+			i++
+			var vesc bool
+			var ok bool
+			i, val, vesc, ok = parseString(json, i)
+			if !ok {
+				return i, res, false
+			}
+			if hit {
+				res.Type = String
+				res.Raw = val
+				if vesc {
+					res.Str = unescape(val[1 : len(val)-1])
+				} else {
+					res.Str = val[1 : len(val)-1]
+				}
+			}
+			return i, res, true
+		case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+			i, val = parseNumber(json, i)
+			if hit {
+				res.Raw = val
+				res.Type = Number
+				res.Num, _ = strconv.ParseFloat(val, 64)
+			}
+			return i, res, true
+		case 't', 'f', 'n':
+			vc := json[i]
+			i, val = parseLiteral(json, i)
+			if hit {
+				res.Raw = val
+				switch vc {
+				case 't':
+					res.Type = True
+				case 'f':
+					res.Type = False
+				}
+				return i, res, true
+			}
+		}
+	}
+	return i, res, false
+}
+
+var ( // used for testing
+	testWatchForFallback bool
+	testLastWasFallback  bool
+)
+
+// GetMany searches json for the multiple paths.
+// The return value is a Result array where the number of items
+// will be equal to the number of input paths.
+func GetMany(json string, path ...string) []Result {
+	res := make([]Result, len(path))
+	for i, path := range path {
+		res[i] = Get(json, path)
+	}
+	return res
+}
+
+// GetManyBytes searches json for the multiple paths.
+// The return value is a Result array where the number of items
+// will be equal to the number of input paths.
+func GetManyBytes(json []byte, path ...string) []Result {
+	res := make([]Result, len(path))
+	for i, path := range path {
+		res[i] = GetBytes(json, path)
+	}
+	return res
+}
+
+var fieldsmu sync.RWMutex
+var fields = make(map[string]map[string]int)
+
+func assign(jsval Result, goval reflect.Value) {
+	if jsval.Type == Null {
+		return
+	}
+	switch goval.Kind() {
+	default:
+	case reflect.Ptr:
+		if !goval.IsNil() {
+			newval := reflect.New(goval.Elem().Type())
+			assign(jsval, newval.Elem())
+			goval.Elem().Set(newval.Elem())
+		} else {
+			newval := reflect.New(goval.Type().Elem())
+			assign(jsval, newval.Elem())
+			goval.Set(newval)
+		}
+	case reflect.Struct:
+		fieldsmu.RLock()
+		sf := fields[goval.Type().String()]
+		fieldsmu.RUnlock()
+		if sf == nil {
+			fieldsmu.Lock()
+			sf = make(map[string]int)
+			for i := 0; i < goval.Type().NumField(); i++ {
+				f := goval.Type().Field(i)
+				tag := strings.Split(f.Tag.Get("json"), ",")[0]
+				if tag != "-" {
+					if tag != "" {
+						sf[tag] = i
+						sf[f.Name] = i
+					} else {
+						sf[f.Name] = i
+					}
+				}
+			}
+			fields[goval.Type().String()] = sf
+			fieldsmu.Unlock()
+		}
+		jsval.ForEach(func(key, value Result) bool {
+			if idx, ok := sf[key.Str]; ok {
+				f := goval.Field(idx)
+				if f.CanSet() {
+					assign(value, f)
+				}
+			}
+			return true
+		})
+	case reflect.Slice:
+		if goval.Type().Elem().Kind() == reflect.Uint8 && jsval.Type == String {
+			data, _ := base64.StdEncoding.DecodeString(jsval.String())
+			goval.Set(reflect.ValueOf(data))
+		} else {
+			jsvals := jsval.Array()
+			slice := reflect.MakeSlice(goval.Type(), len(jsvals), len(jsvals))
+			for i := 0; i < len(jsvals); i++ {
+				assign(jsvals[i], slice.Index(i))
+			}
+			goval.Set(slice)
+		}
+	case reflect.Array:
+		i, n := 0, goval.Len()
+		jsval.ForEach(func(_, value Result) bool {
+			if i == n {
+				return false
+			}
+			assign(value, goval.Index(i))
+			i++
+			return true
+		})
+	case reflect.Map:
+		if goval.Type().Key().Kind() == reflect.String && goval.Type().Elem().Kind() == reflect.Interface {
+			goval.Set(reflect.ValueOf(jsval.Value()))
+		}
+	case reflect.Interface:
+		goval.Set(reflect.ValueOf(jsval.Value()))
+	case reflect.Bool:
+		goval.SetBool(jsval.Bool())
+	case reflect.Float32, reflect.Float64:
+		goval.SetFloat(jsval.Float())
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		goval.SetInt(jsval.Int())
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		goval.SetUint(jsval.Uint())
+	case reflect.String:
+		goval.SetString(jsval.String())
+	}
+	if len(goval.Type().PkgPath()) > 0 {
+		v := goval.Addr()
+		if v.Type().NumMethod() > 0 {
+			if u, ok := v.Interface().(json.Unmarshaler); ok {
+				u.UnmarshalJSON([]byte(jsval.Raw))
+			}
+		}
+	}
+}
+
+var validate uintptr = 1
+
+// UnmarshalValidationEnabled provides the option to disable JSON validation
+// during the Unmarshal routine. Validation is enabled by default.
+//
+// Deprecated: Use encoder/json.Unmarshal instead
+func UnmarshalValidationEnabled(enabled bool) {
+	if enabled {
+		atomic.StoreUintptr(&validate, 1)
+	} else {
+		atomic.StoreUintptr(&validate, 0)
+	}
+}
+
+// Unmarshal loads the JSON data into the value pointed to by v.
+//
+// This function works almost identically to json.Unmarshal except  that
+// gjson.Unmarshal will automatically attempt to convert JSON values to any Go
+// type. For example, the JSON string "100" or the JSON number 100 can be equally
+// assigned to Go string, int, byte, uint64, etc. This rule applies to all types.
+//
+// Deprecated: Use encoder/json.Unmarshal instead
+func Unmarshal(data []byte, v interface{}) error {
+	if atomic.LoadUintptr(&validate) == 1 {
+		_, ok := validpayload(data, 0)
+		if !ok {
+			return errors.New("invalid json")
+		}
+	}
+	if v := reflect.ValueOf(v); v.Kind() == reflect.Ptr {
+		assign(ParseBytes(data), v)
+	}
+	return nil
+}
+
+func validpayload(data []byte, i int) (outi int, ok bool) {
+	for ; i < len(data); i++ {
+		switch data[i] {
+		default:
+			i, ok = validany(data, i)
+			if !ok {
+				return i, false
+			}
+			for ; i < len(data); i++ {
+				switch data[i] {
+				default:
+					return i, false
+				case ' ', '\t', '\n', '\r':
+					continue
+				}
+			}
+			return i, true
+		case ' ', '\t', '\n', '\r':
+			continue
+		}
+	}
+	return i, false
+}
+func validany(data []byte, i int) (outi int, ok bool) {
+	for ; i < len(data); i++ {
+		switch data[i] {
+		default:
+			return i, false
+		case ' ', '\t', '\n', '\r':
+			continue
+		case '{':
+			return validobject(data, i+1)
+		case '[':
+			return validarray(data, i+1)
+		case '"':
+			return validstring(data, i+1)
+		case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+			return validnumber(data, i+1)
+		case 't':
+			return validtrue(data, i+1)
+		case 'f':
+			return validfalse(data, i+1)
+		case 'n':
+			return validnull(data, i+1)
+		}
+	}
+	return i, false
+}
+func validobject(data []byte, i int) (outi int, ok bool) {
+	for ; i < len(data); i++ {
+		switch data[i] {
+		default:
+			return i, false
+		case ' ', '\t', '\n', '\r':
+			continue
+		case '}':
+			return i + 1, true
+		case '"':
+		key:
+			if i, ok = validstring(data, i+1); !ok {
+				return i, false
+			}
+			if i, ok = validcolon(data, i); !ok {
+				return i, false
+			}
+			if i, ok = validany(data, i); !ok {
+				return i, false
+			}
+			if i, ok = validcomma(data, i, '}'); !ok {
+				return i, false
+			}
+			if data[i] == '}' {
+				return i + 1, true
+			}
+			i++
+			for ; i < len(data); i++ {
+				switch data[i] {
+				default:
+					return i, false
+				case ' ', '\t', '\n', '\r':
+					continue
+				case '"':
+					goto key
+				}
+			}
+			return i, false
+		}
+	}
+	return i, false
+}
+func validcolon(data []byte, i int) (outi int, ok bool) {
+	for ; i < len(data); i++ {
+		switch data[i] {
+		default:
+			return i, false
+		case ' ', '\t', '\n', '\r':
+			continue
+		case ':':
+			return i + 1, true
+		}
+	}
+	return i, false
+}
+func validcomma(data []byte, i int, end byte) (outi int, ok bool) {
+	for ; i < len(data); i++ {
+		switch data[i] {
+		default:
+			return i, false
+		case ' ', '\t', '\n', '\r':
+			continue
+		case ',':
+			return i, true
+		case end:
+			return i, true
+		}
+	}
+	return i, false
+}
+func validarray(data []byte, i int) (outi int, ok bool) {
+	for ; i < len(data); i++ {
+		switch data[i] {
+		default:
+			for ; i < len(data); i++ {
+				if i, ok = validany(data, i); !ok {
+					return i, false
+				}
+				if i, ok = validcomma(data, i, ']'); !ok {
+					return i, false
+				}
+				if data[i] == ']' {
+					return i + 1, true
+				}
+			}
+		case ' ', '\t', '\n', '\r':
+			continue
+		case ']':
+			return i + 1, true
+		}
+	}
+	return i, false
+}
+func validstring(data []byte, i int) (outi int, ok bool) {
+	for ; i < len(data); i++ {
+		if data[i] < ' ' {
+			return i, false
+		} else if data[i] == '\\' {
+			i++
+			if i == len(data) {
+				return i, false
+			}
+			switch data[i] {
+			default:
+				return i, false
+			case '"', '\\', '/', 'b', 'f', 'n', 'r', 't':
+			case 'u':
+				for j := 0; j < 4; j++ {
+					i++
+					if i >= len(data) {
+						return i, false
+					}
+					if !((data[i] >= '0' && data[i] <= '9') ||
+						(data[i] >= 'a' && data[i] <= 'f') ||
+						(data[i] >= 'A' && data[i] <= 'F')) {
+						return i, false
+					}
+				}
+			}
+		} else if data[i] == '"' {
+			return i + 1, true
+		}
+	}
+	return i, false
+}
+func validnumber(data []byte, i int) (outi int, ok bool) {
+	i--
+	// sign
+	if data[i] == '-' {
+		i++
+	}
+	// int
+	if i == len(data) {
+		return i, false
+	}
+	if data[i] == '0' {
+		i++
+	} else {
+		for ; i < len(data); i++ {
+			if data[i] >= '0' && data[i] <= '9' {
+				continue
+			}
+			break
+		}
+	}
+	// frac
+	if i == len(data) {
+		return i, true
+	}
+	if data[i] == '.' {
+		i++
+		if i == len(data) {
+			return i, false
+		}
+		if data[i] < '0' || data[i] > '9' {
+			return i, false
+		}
+		i++
+		for ; i < len(data); i++ {
+			if data[i] >= '0' && data[i] <= '9' {
+				continue
+			}
+			break
+		}
+	}
+	// exp
+	if i == len(data) {
+		return i, true
+	}
+	if data[i] == 'e' || data[i] == 'E' {
+		i++
+		if i == len(data) {
+			return i, false
+		}
+		if data[i] == '+' || data[i] == '-' {
+			i++
+		}
+		if i == len(data) {
+			return i, false
+		}
+		if data[i] < '0' || data[i] > '9' {
+			return i, false
+		}
+		i++
+		for ; i < len(data); i++ {
+			if data[i] >= '0' && data[i] <= '9' {
+				continue
+			}
+			break
+		}
+	}
+	return i, true
+}
+
+func validtrue(data []byte, i int) (outi int, ok bool) {
+	if i+3 <= len(data) && data[i] == 'r' && data[i+1] == 'u' && data[i+2] == 'e' {
+		return i + 3, true
+	}
+	return i, false
+}
+func validfalse(data []byte, i int) (outi int, ok bool) {
+	if i+4 <= len(data) && data[i] == 'a' && data[i+1] == 'l' && data[i+2] == 's' && data[i+3] == 'e' {
+		return i + 4, true
+	}
+	return i, false
+}
+func validnull(data []byte, i int) (outi int, ok bool) {
+	if i+3 <= len(data) && data[i] == 'u' && data[i+1] == 'l' && data[i+2] == 'l' {
+		return i + 3, true
+	}
+	return i, false
+}
+
+// Valid returns true if the input is valid json.
+//
+//  if !gjson.Valid(json) {
+//  	return errors.New("invalid json")
+//  }
+//  value := gjson.Get(json, "name.last")
+//
+func Valid(json string) bool {
+	_, ok := validpayload([]byte(json), 0)
+	return ok
+}
+
+// ValidBytes returns true if the input is valid json.
+//
+//  if !gjson.Valid(json) {
+//  	return errors.New("invalid json")
+//  }
+//  value := gjson.Get(json, "name.last")
+//
+// If working with bytes, this method preferred over Valid(string(data))
+//
+func ValidBytes(json []byte) bool {
+	_, ok := validpayload(json, 0)
+	return ok
+}
+
+func parseUint(s string) (n uint64, ok bool) {
+	var i int
+	if i == len(s) {
+		return 0, false
+	}
+	for ; i < len(s); i++ {
+		if s[i] >= '0' && s[i] <= '9' {
+			n = n*10 + uint64(s[i]-'0')
+		} else {
+			return 0, false
+		}
+	}
+	return n, true
+}
+
+func parseInt(s string) (n int64, ok bool) {
+	var i int
+	var sign bool
+	if len(s) > 0 && s[0] == '-' {
+		sign = true
+		i++
+	}
+	if i == len(s) {
+		return 0, false
+	}
+	for ; i < len(s); i++ {
+		if s[i] >= '0' && s[i] <= '9' {
+			n = n*10 + int64(s[i]-'0')
+		} else {
+			return 0, false
+		}
+	}
+	if sign {
+		return n * -1, true
+	}
+	return n, true
+}
+
+const minUint53 = 0
+const maxUint53 = 4503599627370495
+const minInt53 = -2251799813685248
+const maxInt53 = 2251799813685247
+
+func floatToUint(f float64) (n uint64, ok bool) {
+	n = uint64(f)
+	if float64(n) == f && n >= minUint53 && n <= maxUint53 {
+		return n, true
+	}
+	return 0, false
+}
+
+func floatToInt(f float64) (n int64, ok bool) {
+	n = int64(f)
+	if float64(n) == f && n >= minInt53 && n <= maxInt53 {
+		return n, true
+	}
+	return 0, false
 }
